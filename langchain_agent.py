@@ -37,6 +37,7 @@ SYSTEM_PROMPT = """
   구성종목과 투자위험을 설명할 때 사용한다.
 - FAQ 검색 결과가 여러 개라면 match_score가 가장 높은
   결과를 우선적으로 사용한다.
+- match_score는 질문과 FAQ 임베딩의 코사인 유사도이며 정답 확률이 아니다.
 - 관련성이 낮은 FAQ 내용을 답변에 섞지 않는다.
 
 3. get_etf_price
