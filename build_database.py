@@ -1,331 +1,138 @@
+﻿"""Validate and atomically upsert source CSV files into PostgreSQL."""
 import csv
-import sqlite3
+import sys
+from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+import psycopg
+from psycopg import sql
+from src.db.postgres import get_database_connection
 
-# 프로젝트 경로
 BASE_DIR = Path(__file__).resolve().parent
-
-# 원본 CSV 경로
-ETF_CSV_PATH = BASE_DIR / "data" / "source" / "etf_products.csv"
-FAQ_CSV_PATH = BASE_DIR / "data" / "source" / "faq.csv"
-
-# 생성할 SQLite DB
-DB_PATH = BASE_DIR / "data" / "etf_chatbot.db"
+ETF_CSV_PATH = BASE_DIR / "data/source/etf_products.csv"
+FAQ_CSV_PATH = BASE_DIR / "data/source/FAQ.csv"
+ETF_COLUMNS = (
+    "product_code", "product_name", "asset_manager", "asset_category",
+    "underlying_index", "total_fee_percent", "risk_grade", "listing_date",
+    "top_holdings", "holdings_date", "source_name", "source_url",
+    "source_date", "verified_at",
+)
+FAQ_COLUMNS = (
+    "faq_id", "category", "question", "answer", "keywords", "source_name",
+    "source_url", "source_date", "verified_at",
+)
+DATE_COLUMNS = {"listing_date", "holdings_date", "source_date", "verified_at"}
 
 
 def clean_text(value):
-    """CSV의 빈 값과 공백을 정리합니다."""
-    if value is None:
-        return ""
-
-    return str(value).strip()
+    return str(value).strip() if value is not None else ""
 
 
-def create_tables(cursor):
-    """ETF와 FAQ 테이블을 생성합니다."""
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS etf_products (
-            product_code TEXT PRIMARY KEY,
-            product_name TEXT NOT NULL,
-            asset_manager TEXT,
-            asset_category TEXT,
-            underlying_index TEXT,
-            total_fee_percent REAL,
-            risk_grade TEXT,
-            listing_date TEXT,
-            top_holdings TEXT,
-            holdings_date TEXT,
-            source_name TEXT,
-            source_url TEXT,
-            source_date TEXT,
-            verified_at TEXT
-        )
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS faq (
-            faq_id TEXT PRIMARY KEY,
-            category TEXT,
-            question TEXT NOT NULL,
-            answer TEXT NOT NULL,
-            keywords TEXT,
-            source_name TEXT,
-            source_url TEXT,
-            source_date TEXT,
-            verified_at TEXT
-        )
-        """
-    )
-
-    # 검색 속도를 높이기 위한 인덱스
-    cursor.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_etf_product_name
-        ON etf_products(product_name)
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_faq_question
-        ON faq(question)
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_faq_category
-        ON faq(category)
-        """
-    )
+def convert_value(column, value):
+    value = clean_text(value)
+    if not value:
+        return None
+    if column in DATE_COLUMNS:
+        return date.fromisoformat(value)
+    if column == "total_fee_percent":
+        fee = Decimal(value)
+        if not fee.is_finite() or fee < 0:
+            raise ValueError("Fee must be finite and non-negative")
+        return fee
+    return value
 
 
-def load_etf_products(cursor):
-    """ETF 상품 CSV를 DB에 저장합니다."""
-
-    if not ETF_CSV_PATH.exists():
-        print(f"ETF CSV 파일을 찾을 수 없습니다: {ETF_CSV_PATH}")
-        return 0
-
-    cursor.execute("DELETE FROM etf_products")
-
-    saved_count = 0
-
-    with open(
-        ETF_CSV_PATH,
-        "r",
-        encoding="utf-8-sig",
-        newline=""
-    ) as csv_file:
-
-        reader = csv.DictReader(csv_file)
-
-        required_columns = {
-            "product_code",
-            "product_name",
-        }
-
-        if not required_columns.issubset(reader.fieldnames or []):
-            print("ETF CSV에 product_code와 product_name 열이 필요합니다.")
-            return 0
-
+def read_csv(path, columns, required):
+    records, seen = [], set()
+    with path.open("r", encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        missing = set(columns) - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"{path.name}: missing columns: {', '.join(sorted(missing))}")
         for row in reader:
-            product_code = clean_text(row.get("product_code"))
-            product_name = clean_text(row.get("product_name"))
-
-            if not product_code or not product_name:
-                continue
-
-            total_fee = clean_text(
-                row.get("total_fee_percent")
-            )
-
-            try:
-                total_fee = float(total_fee) if total_fee else None
-            except ValueError:
-                total_fee = None
-
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO etf_products (
-                    product_code,
-                    product_name,
-                    asset_manager,
-                    asset_category,
-                    underlying_index,
-                    total_fee_percent,
-                    risk_grade,
-                    listing_date,
-                    top_holdings,
-                    holdings_date,
-                    source_name,
-                    source_url,
-                    source_date,
-                    verified_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    product_code,
-                    product_name,
-                    clean_text(row.get("asset_manager")),
-                    clean_text(row.get("asset_category")),
-                    clean_text(row.get("underlying_index")),
-                    total_fee,
-                    clean_text(row.get("risk_grade")),
-                    clean_text(row.get("listing_date")),
-                    clean_text(row.get("top_holdings")),
-                    clean_text(row.get("holdings_date")),
-                    clean_text(row.get("source_name")),
-                    clean_text(row.get("source_url")),
-                    clean_text(row.get("source_date")),
-                    clean_text(row.get("verified_at")),
-                ),
-            )
-
-            saved_count += 1
-
-    return saved_count
+            location = f"{path.name}:{reader.line_num}"
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError(f"{location}: invalid column count")
+            for column in required:
+                if not clean_text(row[column]):
+                    raise ValueError(f"{location}: empty {column}")
+            key = clean_text(row[columns[0]])
+            if key in seen:
+                raise ValueError(f"{location}: duplicate key {key}")
+            seen.add(key)
+            values = []
+            for column in columns:
+                try:
+                    values.append(convert_value(column, row[column]))
+                except (ValueError, InvalidOperation) as error:
+                    raise ValueError(f"{location}: invalid {column}") from error
+            records.append(tuple(values))
+    if not records:
+        raise ValueError(f"{path.name}: no data")
+    return records
 
 
-def load_faq(cursor):
-    """FAQ CSV를 DB에 저장합니다."""
-
-    if not FAQ_CSV_PATH.exists():
-        print(f"FAQ CSV 파일을 찾을 수 없습니다: {FAQ_CSV_PATH}")
-        return 0
-
-    cursor.execute("DELETE FROM faq")
-
-    saved_count = 0
-
-    with open(
-        FAQ_CSV_PATH,
-        "r",
-        encoding="utf-8-sig",
-        newline=""
-    ) as csv_file:
-
-        reader = csv.DictReader(csv_file)
-
-        required_columns = {
-            "faq_id",
-            "question",
-            "answer",
-        }
-
-        if not required_columns.issubset(reader.fieldnames or []):
-            print(
-                "FAQ CSV에 faq_id, question, answer 열이 필요합니다."
-            )
-            return 0
-
-        for row in reader:
-            faq_id = clean_text(row.get("faq_id"))
-            question = clean_text(row.get("question"))
-            answer = clean_text(row.get("answer"))
-
-            if not faq_id or not question or not answer:
-                continue
-
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO faq (
-                    faq_id,
-                    category,
-                    question,
-                    answer,
-                    keywords,
-                    source_name,
-                    source_url,
-                    source_date,
-                    verified_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    faq_id,
-                    clean_text(row.get("category")),
-                    question,
-                    answer,
-                    clean_text(row.get("keywords")),
-                    clean_text(row.get("source_name")),
-                    clean_text(row.get("source_url")),
-                    clean_text(row.get("source_date")),
-                    clean_text(row.get("verified_at")),
-                ),
-            )
-
-            saved_count += 1
-
-    return saved_count
-
-
-def show_result(cursor, etf_count, faq_count):
-    """저장 결과를 확인합니다."""
-
-    cursor.execute("SELECT COUNT(*) FROM etf_products")
-    saved_etf_count = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM faq")
-    saved_faq_count = cursor.fetchone()[0]
-
-    print("=" * 60)
-    print("ETF 챗봇 DB 생성 완료")
-    print(f"DB 위치: {DB_PATH}")
-    print("-" * 60)
-    print(f"ETF CSV 처리 건수: {etf_count}")
-    print(f"ETF DB 저장 건수: {saved_etf_count}")
-    print(f"FAQ CSV 처리 건수: {faq_count}")
-    print(f"FAQ DB 저장 건수: {saved_faq_count}")
-    print("=" * 60)
-
-    print("\n[ETF 상품 예시]")
-
-    cursor.execute(
-        """
-        SELECT product_code, product_name, asset_manager
-        FROM etf_products
-        ORDER BY product_name
-        LIMIT 5
-        """
+def upsert_records(cursor, table, columns, records):
+    """Skip unchanged rows; retain rows absent from the CSV."""
+    changed_columns = columns[1:]
+    query = sql.SQL("""
+        INSERT INTO {table} AS current ({columns}) VALUES ({values})
+        ON CONFLICT ({key}) DO UPDATE SET {assignments}
+        WHERE ROW({current_values}) IS DISTINCT FROM ROW({new_values})
+    """).format(
+        table=sql.Identifier(table),
+        columns=sql.SQL(", ").join(map(sql.Identifier, columns)),
+        values=sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+        key=sql.Identifier(columns[0]),
+        assignments=sql.SQL(", ").join(
+            sql.SQL("{0} = EXCLUDED.{0}").format(sql.Identifier(column))
+            for column in changed_columns
+        ),
+        current_values=sql.SQL(", ").join(
+            sql.Identifier("current", column) for column in changed_columns
+        ),
+        new_values=sql.SQL(", ").join(
+            sql.Identifier("excluded", column) for column in changed_columns
+        ),
     )
-
-    for code, name, manager in cursor.fetchall():
-        print(f"{code} | {name} | {manager}")
-
-    print("\n[FAQ 예시]")
-
-    cursor.execute(
-        """
-        SELECT faq_id, category, question
-        FROM faq
-        ORDER BY faq_id
-        LIMIT 5
-        """
-    )
-
-    for faq_id, category, question in cursor.fetchall():
-        print(f"{faq_id} | {category} | {question}")
+    cursor.executemany(query, records)
+    return cursor.rowcount
 
 
 def build_database():
-    """전체 DB 생성 과정입니다."""
+    products = read_csv(ETF_CSV_PATH, ETF_COLUMNS, ("product_code", "product_name"))
+    faqs = read_csv(FAQ_CSV_PATH, FAQ_COLUMNS, ("faq_id", "question", "answer"))
+    # Connection context commits on success, rolls back on failure, then closes.
+    with get_database_connection() as connection:
+        with connection.cursor() as cursor:
+            changed_products = upsert_records(cursor, "etf_products", ETF_COLUMNS, products)
+            changed_faqs = upsert_records(cursor, "faq", FAQ_COLUMNS, faqs)
+            cursor.execute("SELECT COUNT(*) FROM etf_products")
+            product_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM faq")
+            faq_count = cursor.fetchone()[0]
+    print("PostgreSQL import complete")
+    print(f"ETF: processed={len(products)}, changed={changed_products}, total={product_count}")
+    print(f"FAQ: processed={len(faqs)}, changed={changed_faqs}, total={faq_count}")
 
-    DB_PATH.parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
 
-    connection = sqlite3.connect(DB_PATH)
-    cursor = connection.cursor()
-
+def main():
     try:
-        create_tables(cursor)
-
-        etf_count = load_etf_products(cursor)
-        faq_count = load_faq(cursor)
-
-        connection.commit()
-
-        show_result(
-            cursor,
-            etf_count,
-            faq_count
+        build_database()
+    except (OSError, ValueError) as error:
+        print(f"Input error: {error}", file=sys.stderr)
+        return 1
+    except psycopg.Error as error:
+        # Avoid exposing credentials or complete rows in diagnostics.
+        print(
+            f"PostgreSQL import failed ({type(error).__name__}). "
+            "Check Docker, .env and database/schema.sql. No import changes committed.",
+            file=sys.stderr,
         )
-
-    except Exception as error:
-        connection.rollback()
-        print(f"DB 생성 중 오류가 발생했습니다: {error}")
-
-    finally:
-        connection.close()
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    build_database()
+    raise SystemExit(main())

@@ -18,7 +18,7 @@
 | 화면 | Streamlit 웹 챗봇 |
 | AI 프레임워크 | LangChain |
 | LLM | OpenAI API (`gpt-5.4-mini`) |
-| 데이터 저장 | CSV 원본 + SQLite |
+| 데이터 저장 | CSV 원본 + PostgreSQL (pgvector) |
 | 외부 데이터 | 금융위원회 ETF 시세 API, DART Open API |
 
 ### 핵심 원칙
@@ -40,14 +40,14 @@
 | LangChain 오케스트레이터 | 구현 완료 | 질문을 분석해 필요한 전문 도구 선택 |
 | ETF 상품 DB | 구현 완료 | 공개 자료 기반 ETF 상품 20개 저장 |
 | FAQ DB | 구현 완료 | ETF 개념·가격·거래·비용·위험 FAQ 25개 저장 |
-| ETF 상품 검색 | 구현 완료 | 상품명 또는 종목코드로 SQLite 조회 |
+| ETF 상품 검색 | 구현 완료 | 상품명 또는 종목코드로 PostgreSQL 조회 |
 | FAQ 검색 | 구현 완료 | 질문과 관련된 FAQ를 검색해 답변 근거로 활용 |
 | ETF 시세 조회 | 구현 완료 | 공공데이터 API에서 최근 기준일 종가·NAV 조회 |
 | DART 공시 조회 | 구현 완료 | 관련 공시 제목·접수일·원문 링크 제공 |
 | 복합 도구 호출 | 구현 완료 | 시세와 공시를 함께 요청하면 두 도구 동시 호출 |
 | 조회 결과 검증 | 구현 완료 | 상품명·날짜·수치·출처·공시 링크 검사 |
 | 출처 표시 | 구현 완료 | 답변에 공식 자료 출처와 링크 표시 |
-| 응답시간 기록 | 구현 완료 | 질문별 응답시간과 API 사용 여부를 CSV로 기록 |
+| 응답시간 기록 | 구현 완료 | 질문별 응답시간과 API 사용 여부를 MongoDB로 기록 |
 | 독립 최종 검토 에이전트 | 추후 과제 | 최종 답변의 컴플라이언스와 출처를 별도 검토 |
 | 뉴스 에이전트 | 추후 과제 | 뉴스 제목·요약·링크 기반 검색 기능 추가 |
 | 클라우드 배포 | 추후 과제 | AWS 또는 Azure 배포 검토 |
@@ -63,10 +63,10 @@ Streamlit 챗봇
   ↓
 LangChain 오케스트레이터
   ├─ search_etf_product
-  │    └─ SQLite ETF 상품 DB 20개
+  │    └─ PostgreSQL ETF 상품 DB 20개
   │
   ├─ search_faq
-  │    └─ SQLite FAQ DB 25개
+  │    └─ PostgreSQL FAQ DB 25개
   │
   ├─ get_etf_price
   │    └─ 금융위원회 ETF 시세 API
@@ -114,7 +114,7 @@ OpenAI 근거 기반 답변 생성
 | AI 프레임워크 | LangChain |
 | LLM 연동 | `langchain-openai`, OpenAI Responses API |
 | LLM 모델 | `gpt-5.4-mini` |
-| 데이터베이스 | SQLite |
+| 데이터베이스 | PostgreSQL + pgvector, MongoDB (응답 로그) |
 | 원본 데이터 | CSV |
 | ETF 시세 | 금융위원회 증권상품시세정보 API |
 | 공시 | DART Open API |
@@ -136,19 +136,20 @@ eft_chatbot_demo/
 ├─ etf_api.py                # 금융위원회 ETF 시세 API 호출
 ├─ dart_api.py               # DART 공시 검색
 ├─ result_validator.py       # API 조회 결과 검증
-├─ build_database.py         # CSV를 SQLite DB로 변환
+├─ build_database.py         # CSV를 PostgreSQL에 적재
 ├─ requirements.txt          # 설치 라이브러리
 ├─ README.md
 ├─ .env.example              # API 키 입력 형식 예시
 ├─ .streamlit/
 │  └─ config.toml            # Streamlit 화면 테마
 ├─ data/
-│  ├─ etf_chatbot.db         # 실행용 SQLite DB
+│  ├─ etf_chatbot.db         # 이전 SQLite 데이터 (현재 앱에서 미사용)
 │  └─ source/
 │     ├─ etf_products.csv    # ETF 상품 20개 원본
 │     └─ faq.csv             # ETF FAQ 25개 원본
-└─ logs/
-   └─ response_times.csv     # 실행 후 생성되는 응답시간 기록
+└─ src/
+   ├─ db/                   # PostgreSQL·MongoDB 공통 연결
+   └─ services/request_logger.py # MongoDB 응답 로그 저장
 ```
 
 다음 파일과 폴더는 보안과 용량 문제로 공유·제출하지 않습니다.
@@ -200,11 +201,25 @@ logs/
 - 레버리지·인버스 상품
 - 공시 확인 방법
 
-현재 FAQ 검색은 키워드 점수를 이용하는 간단한 검색 방식입니다. 임베딩과 벡터 DB를 사용하는 의미 기반 검색은 추후 확장 범위입니다.
+FAQ는 OpenAI `text-embedding-3-small`(1,536차원)과 PostgreSQL pgvector로 의미 기반 검색을 수행합니다.
+상품코드·상품명 조회는 정확한 SQL 검색을 유지합니다. 상품 벡터도 저장하지만 현재 상품 조회 도구에서는 사용하지 않습니다.
+첫 사용과 CSV 변경 후에는 아래 임베딩 생성 명령을 실행해야 합니다.
 
 ---
 
 ## 설치 및 실행
+
+### Docker로 로컬 PostgreSQL / MongoDB 실행
+
+Docker Desktop을 실행한 뒤 프로젝트 루트에서 다음 명령으로 두 DB를 시작합니다.
+
+```powershell
+docker compose up -d --wait
+```
+
+기본 접속 포트는 PostgreSQL `5432`, MongoDB `27017`입니다.
+계정, 환경변수, 종료 및 초기화 방법은 [로컬 DB 실행 안내](docs/deployment.md)를 참고하세요.
+현재 앱의 상품·FAQ 조회는 PostgreSQL, FAQ 벡터 검색은 pgvector, 응답 로그는 MongoDB를 사용합니다.
 
 ### 1. 프로젝트 폴더 이동
 
@@ -238,9 +253,11 @@ DART_API_KEY=발급받은_DART_키
 
 실제 API 키는 GitHub 또는 과제 제출 ZIP에 포함하지 않습니다.
 
-### 5. SQLite DB 생성
+### 5. PostgreSQL 데이터 적재
 
-CSV 원본에서 DB를 다시 만들려면 실행합니다.
+Docker DB와 스키마가 준비된 상태에서 CSV 원본을 PostgreSQL에 적재합니다.
+기존 볼륨의 스키마 적용 방법은 [로컬 DB 실행 안내](docs/deployment.md)를 참고하세요.
+앱은 적재한 PostgreSQL 데이터를 조회합니다. 이전 SQLite 파일은 갱신하지 않습니다.
 
 ```powershell
 .\.venv\Scripts\python.exe build_database.py
@@ -249,11 +266,23 @@ CSV 원본에서 DB를 다시 만들려면 실행합니다.
 정상적인 결과:
 
 ```text
-ETF DB 저장 건수: 20
-FAQ DB 저장 건수: 25
+PostgreSQL import complete
+ETF: processed=20, changed=20, total=20
+FAQ: processed=25, changed=25, total=25
 ```
 
 ### 6. LangChain 도구 확인
+
+먼저 `.env`에 유효한 `OPENAI_API_KEY`를 설정한 뒤 상품·FAQ 임베딩을 생성합니다.
+이 작업은 저장된 공개 상품·FAQ 텍스트를 OpenAI API로 전송하며 사용량에 따라 과금됩니다.
+
+```powershell
+.\.venv\Scripts\python.exe build_embeddings.py
+```
+
+재실행 시 변경 없는 문서는 API를 호출하지 않습니다. 기존 DB에서는
+[벡터 검색 설정 안내](docs/deployment.md)의 마이그레이션을 먼저 적용하세요.
+FAQ 검색 시에도 질문 임베딩을 생성하므로 OpenAI API 연결이 필요합니다.
 
 ```powershell
 .\.venv\Scripts\python.exe check_agent_tools.py
@@ -302,10 +331,10 @@ http://localhost:8501
 
 ## 응답시간 기록
 
-챗봇 질문이 처리되면 다음 파일에 기록됩니다.
+챗봇 질문이 처리되면 MongoDB의 다음 컬렉션에 기록됩니다.
 
 ```text
-logs/response_times.csv
+etf_agent.request_logs
 ```
 
 기록 항목:
@@ -315,6 +344,11 @@ logs/response_times.csv
 - 응답 시간
 - 성공 또는 오류 결과
 - ETF 시세 API 사용 여부
+- 요청 ID, 사용 도구 목록, 처리 상태, 오류 유형
+
+시각은 UTC 날짜 타입으로 저장합니다. 로그 저장에는 2초 제한을 적용하며,
+실패해도 답변은 유지하고 화면에 알림을 표시합니다. 실패한 로그의 자동 재전송이나
+기존 CSV 로그의 자동 이전은 수행하지 않습니다.
 
 이 자료는 이후 응답속도 평가와 오류 분석에 활용할 수 있습니다.
 
@@ -377,7 +411,7 @@ ETF 상품 데이터: 20개
 FAQ 데이터: 25개
 ```
 
-CSV를 원본으로 관리하고 `build_database.py`를 실행하면 SQLite의 `etf_products`, `faq` 테이블이 다시 생성됩니다.
+CSV를 원본으로 관리하고 `build_database.py`를 실행하면 PostgreSQL의 `etf_products`, `faq`에 추가·갱신합니다. 변경 없는 행과 CSV에 없는 기존 행은 유지합니다.
 
 ### 6단계: LangChain 도구 구성
 
@@ -514,7 +548,7 @@ KODEX 200의 종가와 관련 공시를 같이 알려줘
 - DART 공시 검색은 현재 삼성자산운용의 일부 KODEX 상품을 중심으로 지원합니다.
 - DART 결과는 공시 제목이 상품명과 일치하는 후보이며 공시 본문을 직접 요약하지 않습니다.
 - 뉴스 검색 기능은 구현하지 않았습니다.
-- 임베딩 기반 벡터 검색은 구현하지 않았습니다.
+- FAQ 벡터 검색의 최소 유사도는 초기값 0.3이며, 실제 질문 평가를 통한 조정이 필요합니다.
 - 별도의 독립 최종 검토 에이전트는 아직 구현하지 않았습니다.
 - 클라우드 배포는 현재 범위에 포함하지 않았습니다.
 - 실제 VOC 대신 사용할 평가용 예상 질문 데이터셋은 추후 구성할 예정입니다.
@@ -526,7 +560,7 @@ KODEX 200의 종가와 관련 공시를 같이 알려줘
 ### 데이터
 
 - ETF 상품정보 자동 갱신
-- FAQ 의미 기반 검색
+- FAQ 벡터 검색 평가 데이터 확장과 유사도 기준 조정
 - 예상 고객 질문 기반 평가 데이터셋 구축
 - 뉴스 제목·요약·링크 수집
 - 데이터 출처와 기준일 품질 관리

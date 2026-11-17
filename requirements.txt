@@ -4,3 +4,5 @@ python-dotenv
 requests
 langchain
 langchain-openai
+psycopg[binary]>=3.2,<4
+pymongo>=4.6,<5

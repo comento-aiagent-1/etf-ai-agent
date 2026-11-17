@@ -1,13 +1,11 @@
-import csv
 import os
 import time
-from datetime import datetime
-from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 
 from langchain_agent import run_etf_agent
+from src.services.request_logger import save_request_log
 
 
 # =========================================================
@@ -22,6 +20,9 @@ st.set_page_config(
     layout="centered",
 )
 
+if st.session_state.pop("log_save_failed", False):
+    st.warning("답변은 유지되었지만 응답 로그를 저장하지 못했습니다.")
+
 
 TOOL_LABELS = {
     "search_etf_product": "ETF 상품 DB",
@@ -32,64 +33,8 @@ TOOL_LABELS = {
 
 
 # =========================================================
-# 응답 기록 함수
+# 도구 표시 이름
 # =========================================================
-
-def save_response_time(
-    question,
-    elapsed_seconds,
-    result,
-    used_etf_api,
-):
-    """
-    질문별 응답시간과 처리 결과를 CSV에 저장합니다.
-    """
-
-    log_dir = (
-        Path(__file__).resolve().parent
-        / "logs"
-    )
-
-    log_dir.mkdir(exist_ok=True)
-
-    log_file = (
-        log_dir
-        / "response_times.csv"
-    )
-
-    new_file = not log_file.exists()
-
-    with log_file.open(
-        "a",
-        newline="",
-        encoding="utf-8-sig",
-    ) as file:
-
-        writer = csv.writer(file)
-
-        if new_file:
-            writer.writerow(
-                [
-                    "응답 시각",
-                    "질문",
-                    "응답 시간(초)",
-                    "결과",
-                    "ETF API 사용",
-                ]
-            )
-
-        writer.writerow(
-            [
-                datetime.now()
-                .astimezone()
-                .isoformat(timespec="seconds"),
-                question,
-                round(elapsed_seconds, 2),
-                result,
-                used_etf_api,
-            ]
-        )
-
 
 def get_tool_display_names(tool_names):
     """
@@ -420,6 +365,8 @@ if question:
 
     result = "성공"
     used_tools = []
+    status = "success"
+    error_type = None
 
     # 사용자 질문 저장
     st.session_state.messages.append(
@@ -466,6 +413,7 @@ if question:
                 )
 
                 result = "빈 답변"
+                status = "empty_answer"
 
             elif used_tools:
                 result = (
@@ -474,6 +422,8 @@ if question:
                 )
 
         except Exception as error:
+            status = "error"
+            error_type = type(error).__name__
             answer = (
                 "질문을 처리하는 중 문제가 "
                 "발생했습니다. "
@@ -518,21 +468,14 @@ if question:
     )
 
     # 응답시간 기록
-    try:
-        save_response_time(
-            question=question,
-            elapsed_seconds=elapsed_seconds,
-            result=result,
-            used_etf_api=(
-                "get_etf_price"
-                in used_tools
-            ),
-        )
-
-    except OSError:
-        st.warning(
-            "응답 시간 기록을 "
-            "저장하지 못했습니다."
-        )
+    if not save_request_log(
+        question=question,
+        elapsed_seconds=elapsed_seconds,
+        result=result,
+        used_tools=used_tools,
+        status=status,
+        error_type=error_type,
+    ):
+        st.session_state["log_save_failed"] = True
 
     st.rerun()
