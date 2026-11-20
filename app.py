@@ -29,6 +29,7 @@ TOOL_LABELS = {
     "search_faq": "ETF FAQ DB",
     "get_etf_price": "ETF 시세 API",
     "search_etf_disclosure": "DART 공시 API",
+    "search_etf_news": "뉴스 검색",
 }
 
 
@@ -194,6 +195,7 @@ with st.sidebar:
     st.caption("📘 ETF FAQ DB")
     st.caption("📈 ETF 시세 API")
     st.caption("📢 DART 공시 API")
+    st.caption("📰 뉴스 검색")
 
 
 # =========================================================
@@ -255,6 +257,13 @@ if not st.session_state.messages:
             "KODEX 인도Nifty미드캡100의 최근 종가와 NAV를 알려줘",
             "KODEX 200의 관련 공시를 알려줘",
             "KODEX 200의 종가와 관련 공시를 같이 알려줘",
+        ],
+
+        "📰 ETF 뉴스": [
+            "KODEX 200 최근 뉴스 알려줘",
+            "TIGER 미국S&P500 최근 뉴스 알려줘",
+            "KODEX 미국S&P500 최근 뉴스 알려줘",
+            "KODEX 200의 종가와 최근 뉴스를 같이 알려줘",
         ],
     }
 
