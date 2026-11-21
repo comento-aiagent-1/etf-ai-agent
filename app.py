@@ -1,18 +1,27 @@
+import csv
+import logging
 import os
 import time
+from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
+from openai import OpenAI
 
-from langchain_agent import run_etf_agent
+load_dotenv(
+    dotenv_path=Path(__file__).resolve().parent / ".env",
+)
+
+from consultation import LEVELS, consult
+from src.services.diagnostic_logging import log_safe_exception
 from src.services.request_logger import save_request_log
+
+logger = logging.getLogger(__name__)
 
 
 # =========================================================
 # 기본 설정
 # =========================================================
-
-load_dotenv()
 
 st.set_page_config(
     page_title="ETF AI 상담센터",
@@ -30,6 +39,48 @@ TOOL_LABELS = {
     "get_etf_price": "ETF 시세 API",
     "search_etf_disclosure": "DART 공시 API",
 }
+
+KNOWLEDGE_LEVELS = list(LEVELS)
+CATEGORY_LABELS = {
+    "기본개념": "ETF 기초 개념",
+    "가격정보": "ETF 상품 분석 및 비교",
+    "거래": "ETF 거래 및 비용",
+    "비용": "ETF 거래 및 비용",
+    "분배금": "ETF 거래 및 비용",
+    "상품정보": "ETF 투자 시작하기",
+    "위험": "투자 위험 및 고급 개념",
+    "공시": "ETF 상품 분석 및 비교",
+    "투자유의": "ETF 투자 시작하기",
+}
+FAQ_SOURCE_PATH = (
+    Path(__file__).resolve().parent
+    / "data"
+    / "source"
+    / "FAQ.csv"
+)
+
+
+def load_faq_questions():
+    with FAQ_SOURCE_PATH.open(
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as faq_file:
+        return list(csv.DictReader(faq_file))
+
+
+def render_sources(sources, message_index):
+    if sources:
+        with st.expander("참조 자료와 출처"):
+            for index, source in enumerate(sources):
+                name = source.get("source_name", "자료 출처")
+                date = source.get("data_date") or source.get("source_date")
+                verified_at = source.get("verified_at")
+                label = f"{name} · 기준일 {date}" if date else name
+                st.text(f"{label} · 확인일 {verified_at}" if verified_at else label)
+                url = source.get("source_url", "")
+                if isinstance(url, str) and url.startswith(("https://", "http://")):
+                    st.link_button("자료 열기", url, key=f"source_{message_index}_{index}")
 
 
 # =========================================================
@@ -131,11 +182,10 @@ api_key = os.getenv(
 )
 
 if not api_key:
-    st.error(
+    st.warning(
         ".env 파일에서 "
         "OPENAI_API_KEY를 찾지 못했습니다."
     )
-    st.stop()
 
 
 # =========================================================
@@ -145,6 +195,9 @@ if not api_key:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+selected_question = None
+selected_faq = False
+requested_level = None
 
 # =========================================================
 # 사이드바
@@ -155,6 +208,18 @@ with st.sidebar:
 
     st.caption(
         "ETF 질문을 편하게 물어보세요."
+    )
+
+    st.subheader("설명 수준")
+    knowledge_level = st.segmented_control(
+        "ETF 배경지식 수준",
+        KNOWLEDGE_LEVELS,
+        default="입문",
+        key="knowledge_level",
+    )
+    st.caption(
+        "질문에 '입문자예요'처럼 수준을 적으면 "
+        "선택한 수준보다 우선해 반영합니다."
     )
 
     if st.button(
@@ -195,15 +260,47 @@ with st.sidebar:
     st.caption("📈 ETF 시세 API")
     st.caption("📢 DART 공시 API")
 
+    st.divider()
+    st.subheader("자주 묻는 질문")
+    faq_search = st.text_input("FAQ 검색", placeholder="예: 분배금, 환율 위험").strip().casefold()
+    grouped_faqs = {}
+    for faq in load_faq_questions():
+        category = CATEGORY_LABELS.get(faq["category"], faq["category"])
+        searchable = " ".join((faq["question"], category, faq["keywords"])).casefold()
+        if all(term in searchable for term in faq_search.split()):
+            grouped_faqs.setdefault(category, []).append(faq)
+    for category, rows in grouped_faqs.items():
+        with st.expander(f"{category} · {len(rows)}", expanded=bool(faq_search)):
+            for faq in rows:
+                if st.button(faq["question"], key=f"faq_{faq['faq_id']}", width="stretch"):
+                    selected_question = faq["question"]
+                    selected_faq = True
+    if not grouped_faqs:
+        st.info("일치하는 FAQ가 없습니다. 채팅창에 직접 질문해 보세요.")
+
+    latest = st.session_state.messages[-1] if st.session_state.messages else {}
+    if questions and latest.get("role") == "assistant":
+        easy, detailed = st.columns(2)
+        if easy.button("더 쉽게", width="stretch"):
+            requested_level = "입문"
+        if detailed.button("더 자세히", width="stretch"):
+            requested_level = "심화"
+        if requested_level:
+            selected_question = questions[-1]
+            selected_faq = latest.get("selected_faq", False)
+    related = latest.get("related", [])
+    if related:
+        st.subheader("관련 FAQ")
+        for index, related_question in enumerate(related):
+            if st.button(related_question, key=f"related_faq_{index}", width="stretch"):
+                selected_question = related_question
+                selected_faq = True
 
 # =========================================================
 # 메인 화면
 # =========================================================
 
 st.title("ETF AI 상담센터")
-
-selected_question = None
-
 
 # =========================================================
 # 첫 화면 질문 카드
@@ -221,36 +318,14 @@ if not st.session_state.messages:
             "궁금한 주제를 골라보세요."
         )
 
-    faq_groups = {
-        "🌱 ETF 시작하기": [
-            "ETF란 무엇인가요?",
-            "ETF와 주식은 어떻게 다른가요?",
-            "ETF는 어떻게 거래하나요?",
-            "ETF는 원금이 보장되나요?",
-        ],
-
-        "🔎 ETF 상품 이해하기": [
-            "ETF의 기초지수란 무엇인가요?",
-            "ETF 총보수란 무엇인가요?",
-            "ETF 분배금은 무엇인가요?",
-            "해외 ETF에는 환율 위험이 있나요?",
-        ],
-
-        "🛡️ 투자 전 확인하기": [
-            "ETF 괴리율은 무엇인가요?",
-            "추적오차는 무엇인가요?",
-            "ETF 구성종목은 어디서 확인하나요?",
-            "레버리지 ETF와 인버스 ETF는 무엇인가요?",
-        ],
-
-        "📊 상품 DB 조회": [
+    sample_question_groups = {
+        "상품 DB 조회": [
             "TIGER 미국S&P500의 운용사와 기초지수를 알려줘",
             "SOL 미국S&P500의 총보수와 기초지수를 알려줘",
             "KODEX 200의 상품정보를 알려줘",
             "ACE 미국나스닥100의 상품정보를 알려줘",
         ],
-
-        "📈 실제 ETF 자료": [
+        "실제 ETF 자료": [
             "KODEX 200의 최근 종가와 NAV를 알려줘",
             "KODEX 인도Nifty미드캡100의 최근 종가와 NAV를 알려줘",
             "KODEX 200의 관련 공시를 알려줘",
@@ -259,41 +334,19 @@ if not st.session_state.messages:
     }
 
     card_number = 0
-
-    for (
-        group_title,
-        group_questions,
-    ) in faq_groups.items():
-
+    for group_title, group_questions in sample_question_groups.items():
         st.subheader(group_title)
-
-        left, right = st.columns(
-            2,
-            gap="medium",
-        )
-
-        for (
-            index,
-            faq,
-        ) in enumerate(group_questions):
-
-            column = (
-                left
-                if index % 2 == 0
-                else right
-            )
-
+        left, right = st.columns(2, gap="medium")
+        for index, sample_question in enumerate(group_questions):
+            column = left if index % 2 == 0 else right
             with column:
                 if st.button(
-                    faq,
-                    key=f"faq_{card_number}",
+                    sample_question,
+                    key=f"sample_{card_number}",
                     width="stretch",
                 ):
-                    selected_question = faq
-
+                    selected_question = sample_question
             card_number += 1
-
-        st.write("")
 
     st.caption(
         "상품 DB는 공개 자료 기반 샘플 데이터로 구성되어 있습니다. "
@@ -307,7 +360,7 @@ if not st.session_state.messages:
 # 기존 대화 내용 표시
 # =========================================================
 
-for message in st.session_state.messages:
+for message_index, message in enumerate(st.session_state.messages):
     avatar = (
         "👤"
         if message["role"] == "user"
@@ -321,6 +374,7 @@ for message in st.session_state.messages:
         st.markdown(
             message["content"]
         )
+        render_sources(message.get("sources", []), message_index)
 
         used_tools = message.get(
             "used_tools",
@@ -365,6 +419,8 @@ if question:
 
     result = "성공"
     used_tools = []
+    sources = []
+    related = []
     status = "success"
     error_type = None
 
@@ -393,9 +449,14 @@ if question:
                 "AI 에이전트가 질문을 분석하고 "
                 "필요한 자료를 조회하고 있어요..."
             ):
-                agent_result = (
-                    run_etf_agent(question)
-                )
+                level = requested_level or knowledge_level
+                with OpenAI(timeout=20, max_retries=0) as client:
+                    agent_result = consult(
+                        question,
+                        level,
+                        client,
+                        selected_faq=selected_faq,
+                    )
 
             answer = agent_result.get(
                 "answer",
@@ -406,6 +467,8 @@ if question:
                 "used_tools",
                 [],
             )
+            sources = agent_result.get("sources", [])
+            related = agent_result.get("related", [])
 
             if not answer.strip():
                 answer = (
@@ -422,6 +485,11 @@ if question:
                 )
 
         except Exception as error:
+            log_safe_exception(
+                logger,
+                "ETF consultation",
+                error,
+            )
             status = "error"
             error_type = type(error).__name__
             answer = (
@@ -431,12 +499,13 @@ if question:
             )
 
             result = (
-                "LangChain 에이전트 오류: "
+                "ETF 상담 처리 오류: "
                 f"{type(error).__name__}"
             )
 
         # 답변 표시
         st.markdown(answer)
+        render_sources(sources, len(st.session_state.messages))
 
         # 작동한 전문 도구 표시
         if used_tools:
@@ -459,6 +528,9 @@ if question:
                 "role": "assistant",
                 "content": answer,
                 "used_tools": used_tools,
+                "sources": sources,
+                "related": related,
+                "selected_faq": selected_faq,
             }
         )
 

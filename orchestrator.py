@@ -1,7 +1,23 @@
 import json
 
 
-def route_question(question, client):
+def route_question(question, client, *, include_product=False):
+    market_products = ["KODEX 200", "KODEX 인도Nifty미드캡100"]
+    allowed_routes = ["etf_price", "disclosure", "faq", "unsupported", "clarify"]
+    product_instructions = ""
+    name_schema = {"type": "string", "enum": [*market_products, "none"]}
+    if include_product:
+        allowed_routes += ["product", "comparison_unsupported"]
+        name_schema = {"type": "string"}
+        product_instructions = (
+            "상품정보 DB는 시세·공시 지원 목록 밖의 상품도 조회할 수 있다. "
+            "특정 ETF 한 종목의 총보수, 추종지수, 운용사 또는 구성 정보를 묻는 경우 product를 선택하고, "
+            "질문에 있는 상품명 또는 종목코드를 etf_name에 넣는다. "
+            "상품을 임의로 정하지 말고 정보가 부족하면 clarify를 선택한다. "
+            "여러 종목 비교나 조건에 맞는 ETF 목록 검색은 comparison_unsupported를 선택한다. "
+            "일반 개념도 함께 묻는 경우 faq를 추가한다. "
+            "시세·공시는 위 두 상품의 정식 이름만 etf_name에 사용한다."
+        )
     response = client.responses.create(
         model="gpt-5.4-mini",
         instructions=(
@@ -21,7 +37,7 @@ def route_question(question, client):
             "KODEX 인도Nifty미드캡100뿐이다. "
             "지원하지 않는 상품의 etf_name은 none으로 설정하라. "
             "자료 조회 결과나 수치를 만들어내지 마라."
-        ),
+        ) + product_instructions,
         input=question,
         text={
             "format": {
@@ -35,23 +51,10 @@ def route_question(question, client):
                             "type": "array",
                             "items": {
                                 "type": "string",
-                                "enum": [
-                                    "etf_price",
-                                    "disclosure",
-                                    "faq",
-                                    "unsupported",
-                                    "clarify",
-                                ],
+                                "enum": allowed_routes,
                             },
                         },
-                        "etf_name": {
-                            "type": "string",
-                            "enum": [
-                                "KODEX 200",
-                                "KODEX 인도Nifty미드캡100",
-                                "none",
-                            ],
-                        },
+                        "etf_name": name_schema,
                     },
                     "required": ["routes", "etf_name"],
                     "additionalProperties": False,
@@ -72,6 +75,17 @@ def route_question(question, client):
 
     if not routes:
         routes = ["clarify"]
+
+    if include_product:
+        etf_name = etf_name.strip() or "none"
+        if etf_name not in market_products:
+            blocked = {"etf_price", "disclosure"}
+            if blocked.intersection(routes):
+                routes = [route for route in routes if route not in blocked]
+                routes.append("unsupported" if etf_name != "none" else "clarify")
+        if etf_name == "none":
+            routes = ["clarify" if route == "product" else route for route in routes]
+        return {"routes": list(dict.fromkeys(routes)), "etf_name": etf_name}
 
     if etf_name == "none" and any(
         route in routes for route in ["etf_price", "disclosure"]
