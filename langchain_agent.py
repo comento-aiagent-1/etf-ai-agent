@@ -8,6 +8,8 @@ from langchain_openai import ChatOpenAI
 
 from agent_tools import ETF_AGENT_TOOLS
 from api_tools import EXTERNAL_API_TOOLS
+from news_api import resolve_news_links
+from news_tools import NEWS_TOOLS
 
 load_dotenv(
     dotenv_path=Path(__file__).resolve().parent / ".env",
@@ -48,8 +50,18 @@ SYSTEM_PROMPT = """
   질문할 때 사용한다.
 - 공시 제목만으로 구체적인 변경 내용을 추측하지 않는다.
 
+5. search_etf_news
+- 특정 ETF와 관련된 최근 뉴스 기사 제목·언론사·날짜·링크를 조회한다.
+- 사용자가 뉴스, 기사, 최근 소식 또는 이슈를 질문할 때 사용한다.
+- 기사 제목만으로 기사 내용이나 시장 전망을 추측하지 않는다.
+- 기사 제목에 나온 가격·수익률 숫자를 공식 시세처럼 말하지 않는다.
+  가격은 get_etf_price 결과만 사용한다.
+- 뉴스를 근거로 매수 또는 매도를 권하지 않는다.
+
 종가와 공시를 함께 요청하면 get_etf_price와
 search_etf_disclosure를 모두 호출해야 한다.
+여러 종류의 자료(예: 종가와 뉴스)를 함께 요청하면
+필요한 도구를 모두 호출해야 한다.
 
 반드시 다음 원칙을 지켜라.
 
@@ -62,6 +74,9 @@ search_etf_disclosure를 모두 호출해야 한다.
 - 사용자가 밝힌 배경지식 또는 제공된 설명 수준에 맞춰 어휘와 용어 풀이를 조정한다.
 - 답변은 필요 이상으로 길게 작성하지 않는다.
 - 공시 조회 결과에 원문 URL이 있으면 각 공시 제목과 링크를 반드시 함께 표시한다.
+- 뉴스 조회 결과는 기사마다 한 줄로 "- [기사 제목](url) · 언론사 · 날짜"
+  형식으로 표시한다. url 자리에는 조회 결과의 url 값(NEWS_LINK_로 시작)을
+  글자 하나 바꾸지 말고 그대로 쓴다. 다른 주소를 만들어 쓰지 않는다.
 - 조회 결과에 포함된 출처 URL을 임의로 생략하지 않는다.
 - 이미 조회한 자료를 두고 나중에 제공하겠다고 답하지 않는다.
 - 질문에 여러 요청이 들어 있으면 각 의도를 나누어 필요한 FAQ·상품·외부 자료 도구를 모두 사용한다.
@@ -86,7 +101,7 @@ if OPENAI_API_KEY:
 
     etf_agent = create_agent(
         model=model,
-        tools=ETF_AGENT_TOOLS + EXTERNAL_API_TOOLS,
+        tools=ETF_AGENT_TOOLS + EXTERNAL_API_TOOLS + NEWS_TOOLS,
         system_prompt=SYSTEM_PROMPT,
         name="etf_orchestrator",
     )
@@ -209,7 +224,7 @@ def run_etf_agent(question, knowledge_level=None):
                 used_tools.append(tool_name)
 
     final_message = messages[-1]
-    answer = extract_answer(final_message)
+    answer = resolve_news_links(extract_answer(final_message))
 
     return {
         "answer": answer,
