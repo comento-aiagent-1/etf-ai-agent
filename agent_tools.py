@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import date
 from decimal import Decimal
 
@@ -6,7 +7,10 @@ from langchain_core.tools import tool
 from psycopg.rows import dict_row
 
 from src.db.postgres import get_database_connection
+from src.services.diagnostic_logging import log_safe_exception
 from src.services.vector_search import search_faq_vectors
+
+logger = logging.getLogger(__name__)
 
 
 BRAND_ALIASES = {
@@ -318,43 +322,19 @@ def search_faq(user_question: str) -> str:
         )
 
     try:
-        results = [
-            remove_empty_values(row)
-            for row in search_faq_vectors(
-                question
-            )
-        ]
-
-    except Exception:
-        return json.dumps(
-            {
-                "success": False,
-                "message": (
-                    "FAQ 벡터 검색을 사용할 수 없습니다. "
-                    "임베딩 생성, API 키와 DB 설정을 "
-                    "확인해 주세요."
-                ),
-                "results": [],
-            },
-            ensure_ascii=False,
+        results = [remove_empty_values(row) for row in search_faq_vectors(question)]
+    except Exception as error:
+        log_safe_exception(
+            logger,
+            "FAQ retrieval",
+            error,
         )
-
-    return json.dumps(
-        {
-            "success": bool(results),
-            "message": (
-                "관련 FAQ를 찾았습니다."
-                if results
-                else (
-                    "관련 FAQ를 찾지 못했습니다. "
-                    "질문을 조금 더 구체적으로 "
-                    "입력해 주세요."
-                )
-            ),
-            "results": results,
-        },
-        ensure_ascii=False,
-    )
+        return json.dumps({"success": False,
+                           "message": "FAQ 벡터 검색을 사용할 수 없습니다. 임베딩 생성, API 키와 DB 설정을 확인해 주세요.",
+                           "results": []}, ensure_ascii=False)
+    return json.dumps({"success": bool(results),
+                       "message": "관련 FAQ를 찾았습니다." if results else "관련 FAQ 벡터가 없습니다. 임베딩 생성 여부를 확인하거나 질문을 구체적으로 입력해 주세요.",
+                       "results": results}, ensure_ascii=False)
 
 
 ETF_AGENT_TOOLS = [
