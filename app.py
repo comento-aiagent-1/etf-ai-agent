@@ -286,7 +286,7 @@ with st.sidebar:
         if easy.button("더 쉽게", width="stretch"):
             requested_level = "입문"
         if detailed.button("더 자세히", width="stretch"):
-            requested_level = "심화"
+            requested_level = "고급"
         if requested_level:
             selected_question = questions[-1]
             selected_faq = latest.get("selected_faq", False)

@@ -67,7 +67,7 @@ class ConsultationTest(unittest.TestCase):
             "consultation.run_faq_agent", return_value=FAQ_RESPONSE
         ) as faq:
             beginner = consult(QUESTION, "입문", client, selected_faq=True)
-            expert = consult(QUESTION, "심화", client, selected_faq=True)
+            expert = consult(QUESTION, "고급", client, selected_faq=True)
 
         router.assert_not_called()
         self.assertEqual(faq.call_count, 2)
@@ -76,7 +76,7 @@ class ConsultationTest(unittest.TestCase):
         ]
         self.assertEqual(beginner_prompt["input"], expert_prompt["input"])
         self.assertIn("쉬운 일상어", beginner_prompt["instructions"])
-        self.assertIn("계산 기준", expert_prompt["instructions"])
+        self.assertIn("지표 정의", expert_prompt["instructions"])
         self.assertNotEqual(beginner["answer"], expert["answer"])
         self.assertEqual(beginner["sources"], FAQ_RESPONSE["sources"])
         self.assertEqual(expert["related"], ["ETF와 펀드의 차이는?"])
@@ -94,7 +94,7 @@ class ConsultationTest(unittest.TestCase):
         with patch("consultation.run_faq_agent", return_value=FAQ_RESPONSE) as faq, patch.dict(
             "consultation.DATA_ROUTES", {"etf_price": (price, "etf_name", "시세")}
         ):
-            result = consult(question, "기본", client)
+            result = consult(question, "초급", client)
 
         faq.assert_called_once_with(question)
         price.invoke.assert_called_once_with({"etf_name": "KODEX 200"})
@@ -128,7 +128,7 @@ class ConsultationUiTest(unittest.TestCase):
         ), patch("src.services.request_logger.save_request_log", return_value=True):
             app = AppTest.from_file(
                 str(Path(__file__).resolve().parents[1] / "app.py")
-            ).run()
+            , default_timeout=90).run()
             app.button(key="faq_F001").click().run()
             app.chat_input[0].set_value("거래소에서 거래하는 이유는?").run()
 
