@@ -7,6 +7,7 @@ import pymongo
 from pymongo.errors import PyMongoError
 
 from src.db.mongo import LOG_TIMEOUT_MS, get_log_collection
+from src.services.diagnostic_logging import log_safe_exception
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,5 @@ def save_request_log(*, question, elapsed_seconds, result, used_tools,
             get_log_collection().insert_one(document)
         return True
     except (PyMongoError, ValueError, TypeError, OSError) as error:
-        # Do not include credentials, user questions, or exception messages.
-        logger.warning("Request log was not saved (%s)", type(error).__name__)
+        log_safe_exception(logger, "MongoDB request-log write", error)
         return False
