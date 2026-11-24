@@ -4,7 +4,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from consultation import consult
-from orchestrator import route_question
+from orchestrator import fast_route_question, route_question
+from src.services.conversation_memory import prepare_recent_history
 from streamlit.testing.v1 import AppTest
 
 
@@ -21,6 +22,92 @@ FAQ_RESPONSE = {
 
 
 class ConsultationTest(unittest.TestCase):
+    def test_recent_history_keeps_only_text_from_last_three_turns(self):
+        messages = [
+            {"role": "user", "content": f"질문 {index}", "sources": ["제외"]}
+            if index % 2 == 0
+            else {"role": "assistant", "content": f"답변 {index}", "used_tools": ["제외"]}
+            for index in range(8)
+        ]
+
+        history = prepare_recent_history(messages)
+
+        self.assertEqual(len(history), 6)
+        self.assertEqual(history[0], {"role": "user", "content": "질문 2"})
+        self.assertEqual(history[-1], {"role": "assistant", "content": "답변 7"})
+
+    def test_router_receives_recent_context_for_follow_up_product_reference(self):
+        client = Mock()
+        client.responses.create.return_value.output_text = (
+            '{"routes":["news"],"etf_name":"KODEX 200"}'
+        )
+        history = [
+            {"role": "user", "content": "KODEX 200의 종가를 알려줘"},
+            {"role": "assistant", "content": "기준일 종가는 73,770원입니다."},
+        ]
+
+        result = route_question(
+            "그럼 그 ETF 뉴스는?",
+            client,
+            include_product=True,
+            conversation_history=history,
+        )
+
+        self.assertEqual(
+            result,
+            {"routes": ["news"], "etf_name": "KODEX 200"},
+        )
+        route_input = json.loads(
+            client.responses.create.call_args.kwargs["input"]
+        )
+        self.assertEqual(route_input["recent_conversation"], history)
+        self.assertEqual(route_input["current_question"], "그럼 그 ETF 뉴스는?")
+
+    def test_llm_router_structures_spoken_product_clues_for_database_search(self):
+        client = Mock()
+        client.responses.create.return_value.output_text = json.dumps({
+            "routes": ["product"],
+            "etf_name": "삼성자산운용 KODEX 2000",
+            "product_clues": {
+                "asset_manager": "삼성자산운용",
+                "brand": "KODEX",
+                "number_hint": "2000",
+                "index_hint": "",
+                "market_or_theme": "",
+            },
+        }, ensure_ascii=False)
+
+        result = route_question(
+            "그 삼성자산운용에서 하는 거 코 뭐시기로 시작하고 2000인가로 끝나는 이름 뭐지",
+            client,
+            include_product=True,
+        )
+
+        self.assertEqual(result["routes"], ["product"])
+        self.assertEqual(result["etf_name"], "삼성자산운용 KODEX 2000")
+        self.assertEqual(result["product_clues"]["asset_manager"], "삼성자산운용")
+        self.assertEqual(result["product_clues"]["number_hint"], "2000")
+
+    def test_router_preserves_question_number_when_llm_omits_number_hint(self):
+        client = Mock()
+        client.responses.create.return_value.output_text = json.dumps({
+            "routes": ["product"],
+            "etf_name": "KODEX 상품",
+            "product_clues": {
+                "asset_manager": "",
+                "brand": "KODEX",
+                "number_hint": "",
+                "index_hint": "",
+                "market_or_theme": "",
+            },
+        })
+        result = route_question(
+            "KODEX 300이라는 상품 맞아?",
+            client,
+            include_product=True,
+        )
+        self.assertEqual(result["product_clues"]["number_hint"], "300")
+
     def test_progress_callback_reports_real_processing_stages(self):
         client = Mock()
         client.responses.create.return_value = Mock(
@@ -32,7 +119,7 @@ class ConsultationTest(unittest.TestCase):
             "consultation.run_faq_agent",
             return_value=FAQ_RESPONSE,
         ):
-            consult(
+            result = consult(
                 QUESTION,
                 "입문",
                 client,
@@ -46,6 +133,13 @@ class ConsultationTest(unittest.TestCase):
         self.assertEqual(stages[0], "질문 분석 중")
         self.assertIn("자료 조회 중", stages)
         self.assertEqual(stages[-1], "답변 생성 중")
+        self.assertEqual(result["timings"]["router_seconds"], 0.0)
+        self.assertGreaterEqual(result["timings"]["faq_seconds"], 0.0)
+        self.assertGreaterEqual(
+            result["timings"]["answer_generation_seconds"],
+            0.0,
+        )
+        self.assertGreaterEqual(result["timings"]["consultation_seconds"], 0.0)
 
     def test_existing_router_schema_still_uses_original_routes(self):
         client = Mock()
@@ -62,10 +156,9 @@ class ConsultationTest(unittest.TestCase):
 
     def test_news_route_reaches_news_tool_and_keeps_article_sources(self):
         client = Mock()
-        client.responses.create.side_effect = [
-            Mock(output_text='{"routes":["news"],"etf_name":"KODEX 200"}'),
-            Mock(output_text="최근 ETF 뉴스 제목을 확인했습니다."),
-        ]
+        client.responses.create.return_value = Mock(
+            output_text="최근 ETF 뉴스 제목을 확인했습니다."
+        )
         news = Mock()
         news.name = "search_etf_news"
         news.invoke.return_value = json.dumps({
@@ -99,10 +192,9 @@ class ConsultationTest(unittest.TestCase):
 
     def test_product_and_price_both_reach_database_backed_tools(self):
         client = Mock()
-        client.responses.create.side_effect = [
-            Mock(output_text='{"routes":["product","etf_price"],"etf_name":"SOL 미국S&P500"}'),
-            Mock(output_text="확인된 총보수는 0.05%입니다."),
-        ]
+        client.responses.create.return_value = Mock(
+            output_text="확인된 총보수는 0.05%입니다."
+        )
         product = Mock()
         product.name = "search_etf_product"
         product.invoke.return_value = json.dumps({
@@ -140,6 +232,240 @@ class ConsultationTest(unittest.TestCase):
             result,
             {"routes": ["etf_price"], "etf_name": "달토끼 우주여행 ETF"},
         )
+
+    def test_fast_router_handles_explicit_single_and_combined_requests(self):
+        self.assertEqual(
+            fast_route_question(
+                "KODEX 200 최근 뉴스 알려줘",
+                include_product=True,
+            ),
+            {"routes": ["news"], "etf_name": "KODEX 200", "router_mode": "rule"},
+        )
+        self.assertEqual(
+            fast_route_question(
+                "KODEX 200의 종가와 공시를 같이 알려줘",
+                include_product=True,
+            ),
+            {
+                "routes": ["etf_price", "disclosure"],
+                "etf_name": "KODEX 200",
+                "router_mode": "rule",
+            },
+        )
+
+    def test_fast_router_summarizes_named_product_but_defers_missing_context(self):
+        self.assertEqual(
+            fast_route_question("KODEX 200 어때?", include_product=True),
+            {
+                "routes": ["product"],
+                "etf_name": "KODEX 200",
+                "router_mode": "rule",
+            },
+        )
+        self.assertIsNone(fast_route_question("요즘 어때?", include_product=True))
+        self.assertIsNone(
+            fast_route_question(
+                "그럼 그 ETF 뉴스는?",
+                include_product=True,
+                conversation_history=[{"role": "user", "content": "KODEX 200 알려줘"}],
+            )
+        )
+
+    def test_investment_advice_is_blocked_and_uses_recent_product_context(self):
+        history = [
+            {"role": "user", "content": "KODEX 200 어때?"},
+            {"role": "assistant", "content": "KODEX 200 상품정보입니다."},
+        ]
+        self.assertEqual(
+            fast_route_question(
+                "지금 당장 구매할까?",
+                include_product=True,
+                conversation_history=history,
+            ),
+            {
+                "routes": ["investment_guidance"],
+                "etf_name": "KODEX 200",
+                "router_mode": "rule",
+            },
+        )
+
+        client = Mock()
+        result = consult(
+            "지금 당장 구매할까?",
+            "입문",
+            client,
+            conversation_history=history,
+        )
+
+        client.responses.create.assert_not_called()
+        self.assertEqual(result["used_tools"], [])
+        self.assertIn("KODEX 200", result["answer"])
+        self.assertIn("매수·매도", result["answer"])
+        self.assertIn("상품 추천은 제공하지 않습니다", result["answer"])
+
+    def test_generated_recommendation_is_removed_before_display(self):
+        client = Mock()
+        client.responses.create.return_value = Mock(
+            output_text="지금 KODEX 200 매수를 추천합니다."
+        )
+        product = Mock()
+        product.name = "search_etf_product"
+        product.invoke.return_value = json.dumps({
+            "success": True,
+            "results": [{"product_name": "KODEX 200", "source_name": "테스트"}],
+        })
+
+        with patch.dict(
+            "consultation.DATA_ROUTES",
+            {"product": (product, "search_term", "ETF 상품")},
+        ):
+            result = consult("KODEX 200 어때?", "입문", client)
+
+        self.assertNotIn("매수를 추천합니다", result["answer"])
+        self.assertIn("추천하거나", result["answer"])
+        self.assertIn("적합한 상품인지 판단하지 않습니다", result["answer"])
+
+    def test_recommendation_and_price_forecast_use_separate_safe_messages(self):
+        history = [
+            {"role": "user", "content": "KODEX 200 어때?"},
+            {"role": "assistant", "content": "KODEX 200 상품정보입니다."},
+        ]
+        client = Mock()
+
+        recommendation = consult(
+            "종목 추천해줘 국내",
+            "입문",
+            client,
+            conversation_history=history,
+        )
+        forecast = consult(
+            "코덱스200 내일 올라갈까 가격",
+            "입문",
+            client,
+            conversation_history=history,
+        )
+
+        client.responses.create.assert_not_called()
+        self.assertIn("국내외 ETF나 종목을 골라 추천", recommendation["answer"])
+        self.assertNotIn("앞서 문의하신", recommendation["answer"])
+        self.assertIn("코덱스200", forecast["answer"])
+        self.assertIn("미래 가격이 오를지 내릴지", forecast["answer"])
+        self.assertNotIn("매수·매도", forecast["answer"])
+
+    def test_common_high_risk_phrasings_are_caught_without_llm(self):
+        expected_routes = {
+            "지금 물타기할까?": "investment_guidance",
+            "수익률 높은 1등 ETF 골라줘": "product_recommendation",
+            "KODEX 200 목표가 얼마야?": "price_forecast",
+            "이거 원금 보장돼?": "return_guarantee",
+            "퇴직금 얼마 넣는 게 좋아?": "personalized_allocation",
+        }
+        for question, expected_route in expected_routes.items():
+            with self.subTest(question=question):
+                routed = fast_route_question(question, include_product=True)
+                self.assertEqual(routed["routes"], [expected_route])
+                self.assertEqual(routed["router_mode"], "rule")
+
+        client = Mock()
+        guarantee = consult("이거 원금 보장돼?", "입문", client)
+        allocation = consult("퇴직금 얼마 넣는 게 좋아?", "입문", client)
+        client.responses.create.assert_not_called()
+        self.assertIn("원금이나 수익을 보장할 수 없", guarantee["answer"])
+        self.assertIn("투자금액", allocation["answer"])
+        self.assertIn("맞춤형 포트폴리오", allocation["answer"])
+
+    def test_product_name_recall_defers_to_structured_llm_router(self):
+        questions = (
+            "타이거 200? 상품 이름 뭐였지",
+            "그 TIGER S&P500 이름 그 뭐였더라",
+            "069500 상품명이 뭐야",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                routed = fast_route_question(question, include_product=True)
+                self.assertIsNone(routed)
+
+    def test_pronoun_name_recall_uses_recent_product_without_llm(self):
+        routed = fast_route_question(
+            "그거 정식 이름이 뭐였지?",
+            include_product=True,
+            conversation_history=[
+                {"role": "user", "content": "069500 종가 알려줘"},
+                {"role": "assistant", "content": "KODEX 200의 종가입니다."},
+            ],
+        )
+        self.assertEqual(
+            routed,
+            {
+                "routes": ["product"],
+                "etf_name": "069500",
+                "router_mode": "rule",
+            },
+        )
+
+    def test_similar_recalled_product_asks_for_confirmation_before_lookup(self):
+        client = Mock()
+        client.responses.create.return_value.output_text = json.dumps({
+            "routes": ["product"],
+            "etf_name": "TIGER S&P500",
+            "product_clues": {
+                "asset_manager": "",
+                "brand": "TIGER",
+                "number_hint": "500",
+                "index_hint": "S&P500",
+                "market_or_theme": "",
+            },
+        })
+        product = Mock()
+        product.name = "search_etf_product"
+        resolution = {
+            "success": True,
+            "match_type": "typo_corrected",
+            "product": {
+                "product_name": "TIGER 미국S&P500",
+                "product_code": "360750",
+            },
+            "message": "유사 상품",
+        }
+        with patch(
+            "consultation.resolve_etf_product",
+            return_value=resolution,
+        ), patch.dict(
+            "consultation.DATA_ROUTES",
+            {"product": (product, "search_term", "ETF 상품")},
+        ):
+            result = consult(
+                "그 TIGER S&P500 이름 그 뭐였더라",
+                "입문",
+                client,
+            )
+
+        product.invoke.assert_not_called()
+        client.responses.create.assert_called_once()
+        self.assertIn("TIGER 미국S&P500", result["answer"])
+        self.assertIn("혹시 이 상품이 맞으세요?", result["answer"])
+
+    def test_explicit_news_skips_llm_router_but_still_generates_answer(self):
+        client = Mock()
+        client.responses.create.return_value = Mock(output_text="최근 뉴스를 확인했습니다.")
+        news = Mock()
+        news.name = "search_etf_news"
+        news.invoke.return_value = json.dumps({
+            "success": True,
+            "articles": [],
+            "source_name": "Google 뉴스 RSS",
+            "source_url": "https://news.google.com/",
+        })
+
+        with patch.dict(
+            "consultation.DATA_ROUTES",
+            {"news": (news, "etf_name", "뉴스")},
+        ):
+            result = consult("KODEX 200 최근 뉴스 알려줘", "입문", client)
+
+        self.assertEqual(client.responses.create.call_count, 1)
+        self.assertEqual(result["router_mode"], "rule")
+        news.invoke.assert_called_once_with({"etf_name": "KODEX 200"})
 
     def test_unknown_product_is_clearly_reported_as_not_in_database(self):
         client = Mock()
@@ -263,6 +589,21 @@ class ConsultationUiTest(unittest.TestCase):
         self.assertFalse(second.kwargs["selected_faq"])
         self.assertTrue(callable(first.kwargs["progress_callback"]))
         self.assertTrue(callable(second.kwargs["progress_callback"]))
+        self.assertEqual(first.kwargs["conversation_history"], [])
+        self.assertEqual(
+            second.kwargs["conversation_history"],
+            [
+                {"role": "user", "content": QUESTION},
+                {
+                    "role": "assistant",
+                    "content": response["answer"],
+                    "used_tools": response["used_tools"],
+                    "sources": response["sources"],
+                    "related": response["related"],
+                    "selected_faq": True,
+                },
+            ],
+        )
         self.assertEqual(app.session_state["messages"][1]["sources"], response["sources"])
 
         conversation_expanders = [

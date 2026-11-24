@@ -1,4 +1,5 @@
 import json
+import os
 
 from langchain_core.tools import tool
 
@@ -11,6 +12,13 @@ from result_validator import (
 from src.services.product_catalog import (
     resolve_etf_product,
 )
+from src.services.ttl_cache import TTLCache
+
+
+DISCLOSURE_CACHE_SECONDS = int(
+    os.getenv("DISCLOSURE_CACHE_SECONDS", "1800")
+)
+_DISCLOSURE_CACHE = TTLCache(maxsize=128)
 
 
 def _resolution_error(resolution):
@@ -191,9 +199,17 @@ def search_etf_disclosure(etf_name: str) -> str:
         )
 
     try:
-        result = find_etf_disclosure_titles(
-            canonical_name,
-            asset_manager,
+        result, cache_hit = _DISCLOSURE_CACHE.get_or_set(
+            (
+                "disclosure",
+                canonical_name,
+                asset_manager,
+            ),
+            lambda: find_etf_disclosure_titles(
+                canonical_name,
+                asset_manager,
+            ),
+            ttl_seconds=DISCLOSURE_CACHE_SECONDS,
         )
 
     except (ValueError, RuntimeError) as error:
@@ -239,6 +255,7 @@ def search_etf_disclosure(etf_name: str) -> str:
             "message": result.get(
                 "result_message"
             ),
+            "cache_hit": cache_hit,
             "search_complete": result.get(
                 "search_complete"
             ),

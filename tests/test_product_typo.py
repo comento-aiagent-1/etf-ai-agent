@@ -63,7 +63,58 @@ class ConfirmationTest(unittest.TestCase):
         self.assert_asks("타이거 나스닥", ["133690"])
 
     def test_different_number_is_not_auto_corrected(self):
-        self.assert_asks("KODEX 300", ["069500"])
+        result = match_products("KODEX 300", PRODUCTS)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "product_not_found")
+        self.assertEqual(result["candidates"], [])
+
+    def test_same_number_candidate_excludes_different_number_products(self):
+        result = match_products("TIGER S&P500", PRODUCTS)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "ambiguous_product")
+        self.assertEqual(
+            [item["product_code"] for item in result["candidates"]],
+            ["360750"],
+        )
+
+    def test_natural_manager_and_number_clues_offer_a_confirmable_candidate(self):
+        products = PRODUCTS + [{
+            "product_code": "0000H0",
+            "product_name": "KODEX 인도Nifty미드캡100",
+            "asset_manager": "삼성자산운용",
+        }]
+        result = match_products(
+            "삼성자산운용에서 하는 코 뭐시기로 시작하고 2000인가로 끝나는 상품",
+            products,
+        )
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "ambiguous_product")
+        self.assertEqual(
+            [item["product_code"] for item in result["candidates"]],
+            ["069500"],
+        )
+
+    def test_structured_clues_cover_brand_partial_code_index_and_theme(self):
+        cases = [
+            (
+                {"asset_manager": "삼성", "brand": "코덱스", "number_hint": "200"},
+                "069500",
+            ),
+            (
+                {"number_hint": "133", "index_hint": "나스닥", "market_or_theme": "미국"},
+                "133690",
+            ),
+            (
+                {"asset_manager": "한국투자", "market_or_theme": "금"},
+                "411060",
+            ),
+        ]
+        for clues, expected_code in cases:
+            with self.subTest(clues=clues):
+                from src.services.product_catalog import _structured_clue_match
+                result = _structured_clue_match(clues, PRODUCTS)
+                self.assertIsNotNone(result)
+                self.assertEqual(result["candidates"][0]["product_code"], expected_code)
 
 
 class NotFoundTest(unittest.TestCase):
@@ -127,7 +178,7 @@ class ConsultationProductResolutionTest(unittest.TestCase):
             result = consult("200 종가 알려줘", "입문", client)
 
         price.invoke.assert_not_called()
-        self.assertIn("혹시 이 상품을 찾으셨나요?", result["answer"])
+        self.assertIn("비슷한 ETF 후보가 여러 개", result["answer"])
         self.assertIn("KODEX 200(069500)", result["answer"])
 
 

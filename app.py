@@ -198,6 +198,31 @@ st.html(
             color: #315D96;
             font-size: 0.88rem;
         }
+
+        .scroll-latest-button {
+            position: fixed;
+            right: 2rem;
+            bottom: 5.8rem;
+            z-index: 9999;
+            width: 46px;
+            height: 46px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            background: #FFFFFF;
+            color: #315D96 !important;
+            border: 1px solid #C9D9EC;
+            box-shadow: 0 6px 18px rgba(29, 67, 116, 0.18);
+            text-decoration: none !important;
+            font-size: 1.35rem;
+            font-weight: 700;
+        }
+
+        .scroll-latest-button:hover {
+            background: #EAF2FC;
+            border-color: #7299D0;
+        }
     </style>
     """
 )
@@ -234,7 +259,6 @@ if "faq_view_category" not in st.session_state:
 
 selected_question = None
 selected_faq = False
-requested_level = None
 faq_rows = load_faq_questions()
 
 # =========================================================
@@ -380,15 +404,6 @@ with st.sidebar:
 
     st.divider()
     latest = st.session_state.messages[-1] if st.session_state.messages else {}
-    if questions and latest.get("role") == "assistant":
-        easy, detailed = st.columns(2)
-        if easy.button("더 쉽게", width="stretch"):
-            requested_level = "입문"
-        if detailed.button("더 자세히", width="stretch"):
-            requested_level = "고급"
-        if requested_level:
-            selected_question = questions[-1]
-            selected_faq = latest.get("selected_faq", False)
     related = latest.get("related", [])
     if related:
         st.subheader("관련 FAQ")
@@ -624,10 +639,15 @@ if scroll_target:
         """.replace("SCROLL_TARGET", scroll_target)
     else:
         scroll_javascript = """
-            window.parent.scrollTo({
-                top: window.parent.document.body.scrollHeight,
-                behavior: 'smooth'
-            });
+            const target = window.parent.document.getElementById(
+                'conversation-end'
+            );
+            if (target) {
+                target.scrollIntoView({
+                    behavior: 'smooth',
+                    block: 'end'
+                });
+            }
         """
 
     st.iframe(
@@ -647,6 +667,24 @@ if scroll_target:
 # 사용자 질문 입력
 # =========================================================
 
+if st.session_state.messages:
+    st.html(
+        """
+        <a
+            class="scroll-latest-button"
+            href="#conversation-end"
+            title="최신 답변으로 이동"
+            aria-label="최신 답변으로 이동"
+        >
+            ↓
+        </a>
+        """
+    )
+
+st.html(
+    '<div id="conversation-end" style="height: 1px;"></div>'
+)
+
 typed_question = st.chat_input(
     "ETF에 대해 질문해 보세요"
 )
@@ -663,10 +701,16 @@ question = (
 
 if question:
     started_at = time.perf_counter()
+    conversation_history = list(
+        st.session_state.messages
+    )
 
     result = "성공"
     used_tools = []
     tool_inputs = []
+    stage_timings = {}
+    cache_hits = {}
+    router_mode = None
     sources = []
     related = []
     status = "success"
@@ -681,11 +725,34 @@ if question:
     )
 
     # 사용자 질문 표시
+    st.html('<div id="active-question"></div>')
+
     with st.chat_message(
         "user",
         avatar="👤",
     ):
         st.markdown(question)
+
+    # 첫 화면이나 이전 대화 상단에서 질문해도 새 질문 위치로 이동
+    st.iframe(
+        """
+        <script>
+            window.setTimeout(() => {
+                const target = window.parent.document.getElementById(
+                    'active-question'
+                );
+                if (target) {
+                    target.scrollIntoView({
+                        behavior: 'smooth',
+                        block: 'start'
+                    });
+                }
+            }, 120);
+        </script>
+        """,
+        height=1,
+        alt="새 질문 위치 이동",
+    )
 
     # AI 에이전트 응답
     with st.chat_message(
@@ -708,14 +775,14 @@ if question:
                     )
                     progress_detail.markdown(detail)
 
-                level = requested_level or knowledge_level
                 with OpenAI(timeout=20, max_retries=0) as client:
                     agent_result = consult(
                         question,
-                        level,
+                        knowledge_level,
                         client,
                         selected_faq=selected_faq,
                         progress_callback=update_progress,
+                        conversation_history=conversation_history,
                     )
 
                 progress_detail.markdown(
@@ -743,6 +810,18 @@ if question:
                 "tool_inputs",
                 [],
             )
+
+            stage_timings = agent_result.get(
+                "timings",
+                {},
+            )
+
+            cache_hits = agent_result.get(
+                "cache_hits",
+                {},
+            )
+
+            router_mode = agent_result.get("router_mode")
 
             if not answer.strip():
                 answer = (
@@ -820,16 +899,30 @@ if question:
     )
 
     # 응답시간 기록 (질문 원문 대신 길이와 요약만 저장)
-    if not save_request_log(
-        question_length=len(question),
-        elapsed_seconds=elapsed_seconds,
-        result=result,
-        used_tools=used_tools,
-        tool_inputs=tool_inputs,
-        session_id=st.session_state.log_session_id,
-        status=status,
-        error_type=error_type,
-    ):
+    # 로깅 코드 오류나 DB 장애가 사용자 답변을 중단시키지 않게 합니다.
+    try:
+        log_saved = save_request_log(
+            question_length=len(question),
+            elapsed_seconds=elapsed_seconds,
+            result=result,
+            used_tools=used_tools,
+            tool_inputs=tool_inputs,
+            session_id=st.session_state.log_session_id,
+            status=status,
+            error_type=error_type,
+            stage_timings=stage_timings,
+            cache_hits=cache_hits,
+            router_mode=router_mode,
+        )
+    except Exception as error:
+        log_safe_exception(
+            logger,
+            "Request log write",
+            error,
+        )
+        log_saved = False
+
+    if not log_saved:
         st.session_state["log_save_failed"] = True
 
     st.session_state["scroll_target"] = "latest"
