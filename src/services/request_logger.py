@@ -5,6 +5,7 @@
 요약만 저장하고, 요약에 남는 텍스트도 개인정보 형태는 가립니다.
 """
 import logging
+import math
 import re
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -31,6 +32,23 @@ NO_TOOL_CATEGORY = "기타"
 # 사용자 문장이 그대로 들어가는 항목은 요약에 쓰지 않습니다.
 PRODUCT_ARG_KEYS = ("etf_name", "search_term")
 MAX_PRODUCT_NAME_LENGTH = 40
+
+STAGE_TIMING_KEYS = (
+    "router_seconds",
+    "product_resolution_seconds",
+    "faq_seconds",
+    "price_seconds",
+    "disclosure_seconds",
+    "news_seconds",
+    "product_seconds",
+    "answer_generation_seconds",
+    "consultation_seconds",
+)
+CACHEABLE_TOOLS = (
+    "search_etf_disclosure",
+    "search_etf_news",
+)
+ROUTER_MODES = {"rule", "llm", "selected_faq"}
 
 # 로그에 남는 텍스트에서 가릴 개인정보 형태 (위에서부터 차례로 적용)
 MASK = "***"
@@ -84,9 +102,45 @@ def summarize_tool_inputs(used_tools, tool_inputs):
     return categories, summary
 
 
+def normalize_stage_timings(stage_timings, total_seconds):
+    """허용된 처리 단계의 유한한 시간 값만 로그용 숫자로 정리합니다."""
+
+    normalized = {}
+    source = stage_timings if isinstance(stage_timings, dict) else {}
+
+    for key in STAGE_TIMING_KEYS:
+        try:
+            value = float(source.get(key, 0.0))
+        except (TypeError, ValueError):
+            value = 0.0
+
+        normalized[key] = round(
+            value if math.isfinite(value) and value >= 0 else 0.0,
+            4,
+        )
+
+    normalized["total_seconds"] = round(
+        max(float(total_seconds), 0.0),
+        4,
+    )
+    return normalized
+
+
+def normalize_cache_hits(cache_hits):
+    """외부 API 캐시 대상 도구의 적중 여부만 저장합니다."""
+
+    source = cache_hits if isinstance(cache_hits, dict) else {}
+    return {
+        tool_name: bool(source[tool_name])
+        for tool_name in CACHEABLE_TOOLS
+        if tool_name in source
+    }
+
+
 def save_request_log(*, question_length, elapsed_seconds, result, used_tools,
                      tool_inputs=(), status="success", error_type=None,
-                     session_id=None):
+                     session_id=None, stage_timings=None, cache_hits=None,
+                     router_mode=None):
     """
     요청 로그를 저장합니다.
 
@@ -102,6 +156,12 @@ def save_request_log(*, question_length, elapsed_seconds, result, used_tools,
         "question_summary": summary,
         "categories": categories,
         "elapsed_seconds": round(elapsed_seconds, 3),
+        "stage_timings": normalize_stage_timings(
+            stage_timings,
+            elapsed_seconds,
+        ),
+        "cache_hits": normalize_cache_hits(cache_hits),
+        "router_mode": router_mode if router_mode in ROUTER_MODES else None,
         "result": result,
         "status": status,
         "error_type": error_type,

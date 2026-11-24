@@ -15,6 +15,10 @@ PARTIAL_NAME_MIN_LENGTH = 4
 MAX_SUGGESTIONS = 3
 # 상품명 뒤에 붙어도 같은 상품으로 보는 말 (예: KODEX 200 ETF)
 ALLOWED_NAME_SUFFIXES = ("", "ETF")
+NATURAL_CLUE_MIN_SCORE = 0.72
+NATURAL_CLUE_MARGIN = 0.08
+STRUCTURED_CLUE_MIN_SCORE = 0.45
+STRUCTURED_CLUE_MARGIN = 0.1
 
 BRAND_ALIASES = {
     "코덱스": "KODEX",
@@ -24,6 +28,27 @@ BRAND_ALIASES = {
     "쏠": "SOL",
     "하나로": "HANARO",
 }
+THEME_ALIASES = {
+    "K팝": "KPOP",
+    "케이팝": "KPOP",
+    "중형주": "미드캡",
+    "중소형주": "미드캡",
+    "닛케이": "NIKKEI",
+    "니케이": "NIKKEI",
+}
+
+
+def _manager_aliases(asset_manager: str) -> tuple:
+    """자연어에 자주 쓰는 운용사 축약형을 안전한 길이로 만듭니다."""
+    manager = str(asset_manager or "").strip()
+    aliases = {manager}
+    for suffix in ("자산운용", "투자신탁운용", "운용"):
+        if manager.endswith(suffix):
+            core = manager[:-len(suffix)].strip()
+            # '삼성'처럼 너무 짧은 단어 하나만으로 상품을 좁히지 않습니다.
+            if len(core) >= 4:
+                aliases.add(core)
+    return tuple(alias for alias in aliases if alias)
 
 
 def apply_brand_aliases(text: str) -> str:
@@ -165,11 +190,30 @@ def _fuzzy_match(original_term, normalized_query, products):
             "product": product,
         }
 
+    suggestion_pool = scored
+    query_numbers = _numbers(normalized_query)
+    same_number_pool = [
+        item
+        for item in scored
+        if query_numbers and _numbers(item[1]) == query_numbers
+    ]
+    # 같은 숫자를 가진 후보가 있으면 숫자가 다른 실제 상품은 제외합니다.
+    # 예: TIGER S&P500 질문에 TIGER 200을 함께 제시하지 않습니다.
+    if same_number_pool:
+        suggestion_pool = same_number_pool
+    elif query_numbers:
+        # 숫자가 다른 실제 상품을 오타라고 제시하지 않습니다.
+        # KODEX 300을 KODEX 200으로 바꾸는 식의 금융상품 오인 방지입니다.
+        return None
+
     suggestions = [
         _candidate(product)
-        for similarity, _, product in scored
+        for similarity, _, product in suggestion_pool
         if similarity >= max(FUZZY_SUGGEST_MIN, best_similarity - FUZZY_MARGIN)
     ][:MAX_SUGGESTIONS]
+
+    if not suggestions:
+        return None
 
     return {
         "success": False,
@@ -184,7 +228,181 @@ def _fuzzy_match(original_term, normalized_query, products):
     }
 
 
-def resolve_etf_product(search_term: str) -> dict:
+def _natural_clue_match(original_term, products):
+    """운용사와 숫자를 섞어 말한 회상형 질문에서 확인용 후보를 찾습니다.
+
+    한 가지 단서만으로는 후보를 만들지 않으며, 결과는 항상 사용자 확인을
+    요구합니다. 따라서 유사 상품을 실제 상품으로 자동 확정하지 않습니다.
+    """
+    normalized_query = normalize_product_key(original_term)
+    query_numbers = _numbers(normalized_query)
+    scored = []
+
+    for product in products:
+        clue_count = 0
+        score = 0.0
+        manager_matched = any(
+            normalize_product_key(alias) in normalized_query
+            for alias in _manager_aliases(product.get("asset_manager"))
+        )
+        if manager_matched:
+            clue_count += 1
+            score += 0.6
+
+        product_name = normalize_product_key(product.get("product_name") or "")
+        product_numbers = _numbers(product_name)
+        number_score = 0.0
+        if query_numbers and product_numbers:
+            number_score = max(
+                0.9 if query_number.startswith(product_number) or product_number.startswith(query_number)
+                else _similarity(query_number, product_number)
+                for query_number in query_numbers
+                for product_number in product_numbers
+            )
+            if number_score >= 0.5:
+                clue_count += 1
+                score += 0.4 * number_score
+
+        if clue_count >= 2 and score >= NATURAL_CLUE_MIN_SCORE:
+            scored.append((score, product))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda item: (-item[0], item[1]["product_name"]))
+    best_score = scored[0][0]
+    candidates = [
+        _candidate(product)
+        for score, product in scored
+        if score >= best_score - NATURAL_CLUE_MARGIN
+    ][:MAX_SUGGESTIONS]
+
+    return {
+        "success": False,
+        "error_type": "ambiguous_product",
+        "message": (
+            "말씀하신 운용사와 상품 단서에 가까운 ETF를 찾았습니다. "
+            "자동으로 확정하지 않고 상품을 확인합니다."
+        ),
+        "query": original_term,
+        "normalized_query": normalized_query,
+        "candidates": candidates,
+    }
+
+
+def _structured_clue_match(product_clues, products):
+    """LLM이 추출한 서로 다른 단서를 조합해 DB 후보를 찾습니다."""
+    clues = {
+        key: str((product_clues or {}).get(key) or "").strip()
+        for key in (
+            "asset_manager", "brand", "number_hint",
+            "index_hint", "market_or_theme",
+        )
+    }
+    scored = []
+    useful_theme_tokens = {
+        "금", "미국", "인도", "중국", "일본", "배당", "반도체",
+        "기술주", "주식", "채권", "원유",
+    }
+
+    for product in products:
+        score = 0.0
+        matched_clues = 0
+        name_key = normalize_product_key(product.get("product_name") or "")
+        manager_key = normalize_product_key(product.get("asset_manager") or "")
+        index_key = normalize_product_key(product.get("underlying_index") or "")
+        category_key = normalize_product_key(product.get("asset_category") or "")
+        searchable = "".join((name_key, index_key, category_key))
+
+        manager_hint = normalize_product_key(clues["asset_manager"])
+        if manager_hint:
+            if manager_hint in manager_key or manager_key in manager_hint:
+                score += 0.3
+                matched_clues += 1
+            elif name_key.startswith(manager_hint):
+                # LLM이 ACE 같은 ETF 브랜드를 운용사 칸에 넣어도 브랜드 단서로 사용합니다.
+                score += 0.25
+                matched_clues += 1
+
+        brand_hint = normalize_product_key(clues["brand"])
+        if brand_hint and name_key.startswith(brand_hint):
+            score += 0.25
+            matched_clues += 1
+
+        number_hints = _numbers(clues["number_hint"])
+        code = str(product.get("product_code") or "").upper()
+        name_numbers = _numbers(name_key)
+        if number_hints:
+            code_match = any(code.startswith(number) for number in number_hints)
+            name_match = any(
+                number == product_number
+                or number.startswith(product_number)
+                or product_number.startswith(number)
+                for number in number_hints
+                for product_number in name_numbers
+            )
+            if code_match:
+                score += 0.45
+                matched_clues += 1
+            elif name_match:
+                score += 0.35
+                matched_clues += 1
+
+        index_text = clues["index_hint"]
+        for source, target in THEME_ALIASES.items():
+            index_text = index_text.replace(source, target)
+        index_hint = normalize_product_key(index_text)
+        if index_hint and (
+            index_hint in searchable or any(
+                token and token in searchable
+                for token in re.findall(r"[가-힣A-Z]+|\d+", index_hint)
+                if len(token) >= 2
+            )
+        ):
+            score += 0.25
+            matched_clues += 1
+
+        theme_text = clues["market_or_theme"]
+        for source, target in THEME_ALIASES.items():
+            theme_text = theme_text.replace(source, target)
+        theme_tokens = [
+            token
+            for token in re.findall(
+                r"[가-힣]+|[A-Za-z]+|\d+",
+                theme_text,
+            )
+            if len(token) >= 2 or token in useful_theme_tokens
+        ]
+        if theme_tokens and any(
+            normalize_product_key(token) in searchable
+            for token in theme_tokens
+        ):
+            score += 0.2
+            matched_clues += 1
+
+        if matched_clues >= 2 and score >= STRUCTURED_CLUE_MIN_SCORE:
+            scored.append((score, product))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda item: (-item[0], item[1]["product_name"]))
+    best_score = scored[0][0]
+    candidates = [
+        _candidate(product)
+        for score, product in scored
+        if score >= best_score - STRUCTURED_CLUE_MARGIN
+    ][:MAX_SUGGESTIONS]
+    return {
+        "success": False,
+        "error_type": "ambiguous_product",
+        "message": "질문의 여러 단서와 일치하는 실제 ETF 후보를 찾았습니다.",
+        "query": "structured_clues",
+        "candidates": candidates,
+    }
+
+
+def resolve_etf_product(search_term: str, product_clues=None) -> dict:
     """
     사용자가 입력한 상품명 또는 종목코드를 DB의 정식 상품으로 변환합니다.
 
@@ -233,7 +451,9 @@ def resolve_etf_product(search_term: str) -> dict:
             SELECT
                 product_code,
                 product_name,
-                asset_manager
+                asset_manager,
+                asset_category,
+                underlying_index
             FROM etf_products
             ORDER BY product_name, product_code
             """
@@ -247,7 +467,24 @@ def resolve_etf_product(search_term: str) -> dict:
     finally:
         connection.close()
 
-    return match_products(original_term, products)
+    result = match_products(original_term, products)
+    if result.get("success") or not product_clues:
+        return result
+
+    structured_result = _structured_clue_match(product_clues, products)
+    if structured_result is not None:
+        return structured_result
+
+    clue_text = " ".join(
+        str(product_clues.get(key) or "").strip()
+        for key in (
+            "asset_manager", "brand", "number_hint",
+            "index_hint", "market_or_theme",
+        )
+        if str(product_clues.get(key) or "").strip()
+    )
+    clue_result = _natural_clue_match(clue_text, products) if clue_text else None
+    return clue_result or result
 
 
 def match_products(search_term: str, products: list) -> dict:
@@ -260,6 +497,11 @@ def match_products(search_term: str, products: list) -> dict:
     """
     original_term = str(search_term or "").strip()
     normalized_query = normalize_product_key(original_term)
+    # '200 ETF', 'ETF 200'처럼 검색 의미가 없는 일반 단어는 제거합니다.
+    if normalized_query.startswith("ETF") and len(normalized_query) > 3:
+        normalized_query = normalized_query[3:]
+    if normalized_query.endswith("ETF") and len(normalized_query) > 3:
+        normalized_query = normalized_query[:-3]
 
     if not normalized_query:
         return {
@@ -316,6 +558,10 @@ def match_products(search_term: str, products: list) -> dict:
         if fuzzy_result is not None:
             return fuzzy_result
 
+        clue_result = _natural_clue_match(original_term, products)
+        if clue_result is not None:
+            return clue_result
+
         return {
             "success": False,
             "error_type": "product_not_found",
@@ -365,7 +611,7 @@ def match_products(search_term: str, products: list) -> dict:
 
     return {
         "success": True,
-        "match_type": "exact",
+        "match_type": "partial_match" if best_score == 70 else "exact",
         "message": "ETF 상품을 확인했습니다.",
         "query": original_term,
         "normalized_query": normalized_query,
