@@ -1,4 +1,4 @@
-name: Build, test and publish image
+name: Build, test, publish and deploy
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
 
 concurrency:
   group: image-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   image:
@@ -65,9 +65,103 @@ jobs:
             echo '```dotenv'
             echo "APP_IMAGE=$IMAGE"
             echo '```'
-            echo 'Image publication only; Azure SSH deployment is not configured yet.'
+            echo 'Only a push to main deploys to Azure after publication.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Log out of GHCR
         if: always() && github.event_name != 'pull_request'
         run: docker logout ghcr.io
+
+  deploy:
+    needs: image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    concurrency:
+      group: azure-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VM_HOST: ${{ secrets.VM_HOST }}
+      VM_USER: ${{ secrets.VM_USER }}
+      AZURE_NSG_NAME: ${{ vars.AZURE_NSG_NAME }}
+      AZURE_NSG_RESOURCE_GROUP: ${{ vars.AZURE_NSG_RESOURCE_GROUP }}
+      RULE_NAME: gha-ssh-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Prepare verified SSH connection
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          : "${VM_HOST:?Missing VM_HOST}" "${VM_USER:?Missing VM_USER}"
+          : "${AZURE_NSG_NAME:?Missing AZURE_NSG_NAME}" "${AZURE_NSG_RESOURCE_GROUP:?Missing AZURE_NSG_RESOURCE_GROUP}"
+          : "${SSH_PRIVATE_KEY:?Missing SSH_PRIVATE_KEY}" "${SSH_KNOWN_HOSTS:?Missing SSH_KNOWN_HOSTS}"
+          [[ "$VM_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]
+          [[ "$VM_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          install -m 700 -d "$HOME/.ssh"
+          umask 077
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+
+      - name: Authenticate to Azure using OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Temporarily allow only this runner IP
+        id: nsg
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_ip=$(curl -4fsS --retry 3 --max-time 15 https://api.ipify.org)
+          python3 -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$runner_ip"
+          az network nsg rule list -g "$AZURE_NSG_RESOURCE_GROUP" --nsg-name "$AZURE_NSG_NAME" --query '[].priority' -o json > "$RUNNER_TEMP/nsg-priorities.json"
+          priority=$(python3 -c 'import json,sys; used=json.load(open(sys.argv[1])); print(next(p for p in range(3000,4000) if p not in used))' "$RUNNER_TEMP/nsg-priorities.json")
+          echo 'attempted=true' >> "$GITHUB_OUTPUT"
+          az network nsg rule create -g "$AZURE_NSG_RESOURCE_GROUP" --nsg-name "$AZURE_NSG_NAME" \
+            -n "$RULE_NAME" --priority "$priority" --direction Inbound --access Allow --protocol Tcp \
+            --source-address-prefixes "$runner_ip/32" --source-port-ranges '*' \
+            --destination-address-prefixes '*' --destination-port-ranges 22 \
+            --description "Temporary GitHub deployment ${GITHUB_RUN_ID}" --output none
+
+      - name: Deploy published image and verify health
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
+          ssh_options=(-i "$HOME/.ssh/deploy_key" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+          ready=false
+          for attempt in {1..12}; do
+            if ssh "${ssh_options[@]}" "$VM_USER@$VM_HOST" true; then ready=true; break; fi
+            sleep 5
+          done
+          "$ready" || { echo 'SSH unavailable: check NSG, subnet rules, UFW and authorized_keys.'; exit 1; }
+          ssh "${ssh_options[@]}" "$VM_USER@$VM_HOST" "bash -s -- '$image'" < infra/deploy.sh
+          echo "Deployed: $image" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove temporary SSH rule
+        if: always() && steps.nsg.outputs.attempted == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in {1..3}; do
+            if az network nsg rule delete -g "$AZURE_NSG_RESOURCE_GROUP" --nsg-name "$AZURE_NSG_NAME" -n "$RULE_NAME"; then exit 0; fi
+            sleep 5
+          done
+          echo "::error::Remove leftover NSG rule manually: $RULE_NAME"
+          exit 1
+
+      - name: Remove SSH credentials
+        if: always()
+        run: rm -f "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
