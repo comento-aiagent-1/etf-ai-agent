@@ -198,6 +198,31 @@ st.html(
             color: #315D96;
             font-size: 0.88rem;
         }
+
+        .scroll-latest-button {
+            position: fixed;
+            right: 2rem;
+            bottom: 5.8rem;
+            z-index: 9999;
+            width: 46px;
+            height: 46px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            background: #FFFFFF;
+            color: #315D96 !important;
+            border: 1px solid #C9D9EC;
+            box-shadow: 0 6px 18px rgba(29, 67, 116, 0.18);
+            text-decoration: none !important;
+            font-size: 1.35rem;
+            font-weight: 700;
+        }
+
+        .scroll-latest-button:hover {
+            background: #EAF2FC;
+            border-color: #7299D0;
+        }
     </style>
     """
 )
@@ -624,10 +649,15 @@ if scroll_target:
         """.replace("SCROLL_TARGET", scroll_target)
     else:
         scroll_javascript = """
-            window.parent.scrollTo({
-                top: window.parent.document.body.scrollHeight,
-                behavior: 'smooth'
-            });
+            const target = window.parent.document.getElementById(
+                'conversation-end'
+            );
+            if (target) {
+                target.scrollIntoView({
+                    behavior: 'smooth',
+                    block: 'end'
+                });
+            }
         """
 
     st.iframe(
@@ -646,6 +676,24 @@ if scroll_target:
 # =========================================================
 # 사용자 질문 입력
 # =========================================================
+
+if st.session_state.messages:
+    st.html(
+        """
+        <a
+            class="scroll-latest-button"
+            href="#conversation-end"
+            title="최신 답변으로 이동"
+            aria-label="최신 답변으로 이동"
+        >
+            ↓
+        </a>
+        """
+    )
+
+st.html(
+    '<div id="conversation-end" style="height: 1px;"></div>'
+)
 
 typed_question = st.chat_input(
     "ETF에 대해 질문해 보세요"
@@ -684,11 +732,34 @@ if question:
     )
 
     # 사용자 질문 표시
+    st.html('<div id="active-question"></div>')
+
     with st.chat_message(
         "user",
         avatar="👤",
     ):
         st.markdown(question)
+
+    # 첫 화면이나 이전 대화 상단에서 질문해도 새 질문 위치로 이동
+    st.iframe(
+        """
+        <script>
+            window.setTimeout(() => {
+                const target = window.parent.document.getElementById(
+                    'active-question'
+                );
+                if (target) {
+                    target.scrollIntoView({
+                        behavior: 'smooth',
+                        block: 'start'
+                    });
+                }
+            }, 120);
+        </script>
+        """,
+        height=1,
+        alt="새 질문 위치 이동",
+    )
 
     # AI 에이전트 응답
     with st.chat_message(
