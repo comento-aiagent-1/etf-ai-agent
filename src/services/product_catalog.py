@@ -1,20 +1,32 @@
 import re
 
 from psycopg.rows import dict_row
+from rank_bm25 import BM25Okapi
 
 from src.db.postgres import get_database_connection
 
 
-# 오타 대응(편집 거리 유사도) 기준값. eval_product_search.py로 정했습니다.
-FUZZY_AUTO_MIN = 0.75     # 이 이상이고 2등과 차이가 크면 바로 그 상품으로 연결
-FUZZY_SUGGEST_MIN = 0.6   # 이 이상이면 "혹시 이 상품인가요?" 후보로 제시
-FUZZY_MARGIN = 0.15       # 1등과 2등 유사도 차이가 이보다 작으면 사용자에게 확인
-# '타이거 나스닥'처럼 일부만 썼어도 글자가 상품명에 순서대로 다 들어 있으면 주는 점수
+# 기존 편집 거리 검색 기준값
+FUZZY_AUTO_MIN = 0.75
+FUZZY_SUGGEST_MIN = 0.6
+FUZZY_MARGIN = 0.15
+
 PARTIAL_NAME_SCORE = 0.8
 PARTIAL_NAME_MIN_LENGTH = 4
 MAX_SUGGESTIONS = 3
-# 상품명 뒤에 붙어도 같은 상품으로 보는 말 (예: KODEX 200 ETF)
+
+# 상품명 뒤에 붙어도 같은 상품으로 보는 표현
 ALLOWED_NAME_SUFFIXES = ("", "ETF")
+
+# 편집 거리와 BM25를 결합하는 하이브리드 검색 설정
+EDIT_DISTANCE_WEIGHT = 0.55
+BM25_WEIGHT = 0.45
+CHAR_NGRAM_SIZE = 2
+# BM25 점수가 높아도 최소한의 편집 거리 유사도는 충족해야 합니다.
+FUZZY_EDIT_GATE = 0.6
+
+# 편집 거리 유사도가 매우 높으면 2위와의 점수 차이가 작아도 오타로 인정합니다.
+HIGH_CONFIDENCE_EDIT_MIN = 0.9
 
 BRAND_ALIASES = {
     "코덱스": "KODEX",
@@ -57,30 +69,42 @@ def _candidate(product: dict) -> dict:
 
 
 def _edit_distance(left: str, right: str) -> int:
-    """글자 삽입·삭제·바꾸기·인접 글자 뒤바뀜을 1번으로 세는 편집 거리."""
+    """삽입·삭제·교체·인접 글자 순서 변경을 반영한 편집 거리입니다."""
+
     rows = len(left) + 1
     cols = len(right) + 1
     table = [[0] * cols for _ in range(rows)]
 
-    for i in range(rows):
-        table[i][0] = i
-    for j in range(cols):
-        table[0][j] = j
+    for row in range(rows):
+        table[row][0] = row
 
-    for i in range(1, rows):
-        for j in range(1, cols):
-            cost = 0 if left[i - 1] == right[j - 1] else 1
-            table[i][j] = min(
-                table[i - 1][j] + 1,
-                table[i][j - 1] + 1,
-                table[i - 1][j - 1] + cost,
+    for column in range(cols):
+        table[0][column] = column
+
+    for row in range(1, rows):
+        for column in range(1, cols):
+            cost = (
+                0
+                if left[row - 1] == right[column - 1]
+                else 1
             )
+
+            table[row][column] = min(
+                table[row - 1][column] + 1,
+                table[row][column - 1] + 1,
+                table[row - 1][column - 1] + cost,
+            )
+
             if (
-                i > 1 and j > 1
-                and left[i - 1] == right[j - 2]
-                and left[i - 2] == right[j - 1]
+                row > 1
+                and column > 1
+                and left[row - 1] == right[column - 2]
+                and left[row - 2] == right[column - 1]
             ):
-                table[i][j] = min(table[i][j], table[i - 2][j - 2] + 1)
+                table[row][column] = min(
+                    table[row][column],
+                    table[row - 2][column - 2] + 1,
+                )
 
     return table[-1][-1]
 
@@ -88,15 +112,105 @@ def _edit_distance(left: str, right: str) -> int:
 def _similarity(left: str, right: str) -> float:
     if not left or not right:
         return 0.0
-    return 1 - _edit_distance(left, right) / max(len(left), len(right))
+
+    return (
+        1
+        - _edit_distance(left, right)
+        / max(len(left), len(right))
+    )
 
 
 def _korean_brand_key(normalized_name: str) -> str:
-    """'KODEX200' → '코덱스200'. 한글 브랜드명에 오타가 있을 때 비교용."""
+    """KODEX200을 코덱스200 형태로 변환해 한글 브랜드 오타도 비교합니다."""
+
     for korean_name, english_name in BRAND_ALIASES.items():
         if normalized_name.startswith(english_name):
-            return korean_name + normalized_name[len(english_name):]
+            return (
+                korean_name
+                + normalized_name[len(english_name):]
+            )
+
     return normalized_name
+
+
+def _character_ngrams(
+    text: str,
+    size: int = CHAR_NGRAM_SIZE,
+) -> list[str]:
+    """짧은 상품명 검색을 위해 문자열을 2글자 단위로 나눕니다."""
+
+    compact = "".join(
+        character
+        for character in str(text or "").upper()
+        if character.isalnum()
+    )
+
+    if not compact:
+        return []
+
+    if len(compact) <= size:
+        return [compact]
+
+    return [
+        compact[index:index + size]
+        for index in range(len(compact) - size + 1)
+    ]
+
+
+def _product_name_tokens(normalized_name: str) -> list[str]:
+    """영문·한글 브랜드 표현을 모두 BM25 검색 문서에 포함합니다."""
+
+    variants = {
+        normalized_name,
+        _korean_brand_key(normalized_name),
+    }
+
+    tokens = []
+
+    for variant in variants:
+        tokens.extend(
+            _character_ngrams(variant)
+        )
+
+    return tokens
+
+
+def _bm25_scores(
+    normalized_query: str,
+    normalized_names: list[str],
+) -> list[float]:
+    """질문과 상품명의 BM25 점수를 0~1 범위로 정규화합니다."""
+
+    if not normalized_names:
+        return []
+
+    corpus = [
+        _product_name_tokens(product_name)
+        for product_name in normalized_names
+    ]
+
+    query_tokens = _character_ngrams(
+        normalized_query
+    )
+
+    if not query_tokens or not any(corpus):
+        return [0.0] * len(normalized_names)
+
+    model = BM25Okapi(corpus)
+    raw_scores = model.get_scores(query_tokens)
+
+    highest_score = max(
+        raw_scores,
+        default=0.0,
+    )
+
+    if highest_score <= 0:
+        return [0.0] * len(normalized_names)
+
+    return [
+        max(0.0, float(score / highest_score))
+        for score in raw_scores
+    ]
 
 
 def _numbers(text: str) -> list:
@@ -104,82 +218,224 @@ def _numbers(text: str) -> list:
 
 
 def _is_in_order(short: str, long: str) -> bool:
-    """short의 글자가 long 안에 순서대로 모두 들어 있는지 확인합니다."""
+    """short의 글자가 long에 같은 순서로 들어 있는지 확인합니다."""
+
     remaining = iter(long)
-    return all(character in remaining for character in short)
 
-
-def _name_similarity(normalized_query: str, normalized_name: str) -> float:
-    similarity = max(
-        _similarity(normalized_query, normalized_name),
-        _similarity(normalized_query, _korean_brand_key(normalized_name)),
+    return all(
+        character in remaining
+        for character in short
     )
+
+
+def _name_similarity(
+    normalized_query: str,
+    normalized_name: str,
+) -> float:
+    similarity = max(
+        _similarity(
+            normalized_query,
+            normalized_name,
+        ),
+        _similarity(
+            normalized_query,
+            _korean_brand_key(normalized_name),
+        ),
+    )
+
     if (
-        len(normalized_query) >= PARTIAL_NAME_MIN_LENGTH
-        and _is_in_order(normalized_query, normalized_name)
+        len(normalized_query)
+        >= PARTIAL_NAME_MIN_LENGTH
+        and _is_in_order(
+            normalized_query,
+            normalized_name,
+        )
     ):
-        similarity = max(similarity, PARTIAL_NAME_SCORE)
+        similarity = max(
+            similarity,
+            PARTIAL_NAME_SCORE,
+        )
+
     return similarity
 
 
-def _fuzzy_match(original_term, normalized_query, products):
+def _fuzzy_match(
+    original_term,
+    normalized_query,
+    products,
+):
     """
-    정확히 일치하는 상품이 없을 때 편집 거리로 오타 후보를 찾습니다.
+    정확히 일치하는 상품이 없으면 편집 거리와 BM25를 결합해 검색합니다.
 
-    - 종목코드(숫자만)는 오타로 추정하지 않습니다. 다른 실제 종목일 수 있습니다.
-    - 숫자가 다르면(예: KODEX 300) 다른 상품일 수 있어 바로 연결하지 않고 확인을 요청합니다.
+    종목코드만 입력한 경우에는 다른 종목으로 자동 보정하지 않습니다.
+    숫자가 다른 상품도 자동 확정하지 않고 사용자에게 확인합니다.
     """
+
     if normalized_query.isdigit():
         return None
 
+    normalized_names = [
+        normalize_product_key(
+            product.get("product_name") or ""
+        )
+        for product in products
+    ]
+
+    bm25_scores = _bm25_scores(
+        normalized_query,
+        normalized_names,
+    )
+
     scored = []
-    for product in products:
-        normalized_name = normalize_product_key(product.get("product_name") or "")
-        similarity = _name_similarity(normalized_query, normalized_name)
-        scored.append((similarity, normalized_name, product))
 
-    scored.sort(key=lambda item: (-item[0], item[2]["product_name"]))
+    for product, normalized_name, bm25_score in zip(
+        products,
+        normalized_names,
+        bm25_scores,
+    ):
+        edit_score = _name_similarity(
+            normalized_query,
+            normalized_name,
+        )
 
-    best_similarity, best_name, best_product = scored[0]
-    second_similarity = scored[1][0] if len(scored) > 1 else 0.0
+        weighted_score = (
+            EDIT_DISTANCE_WEIGHT * edit_score
+            + BM25_WEIGHT * bm25_score
+        )
 
-    if best_similarity < FUZZY_SUGGEST_MIN:
+        # 기존 검색보다 성능이 떨어지지 않도록 편집 거리 점수도 유지합니다.
+        hybrid_score = max(
+            edit_score,
+            weighted_score,
+        )
+
+        scored.append(
+            (
+                hybrid_score,
+                edit_score,
+                bm25_score,
+                normalized_name,
+                product,
+            )
+        )
+
+    if not scored:
         return None
 
+    scored.sort(
+        key=lambda item: (
+            -item[0],
+            item[4]["product_name"],
+        )
+    )
+
+    (
+        best_score,
+        best_edit_score,
+        best_bm25_score,
+        best_name,
+        best_product,
+    ) = scored[0]
+
+    second_score = (
+        scored[1][0]
+        if len(scored) > 1
+        else 0.0
+    )
+
     if (
-        best_similarity >= FUZZY_AUTO_MIN
-        and best_similarity - second_similarity >= FUZZY_MARGIN
-        and _numbers(normalized_query) == _numbers(best_name)
+        best_score < FUZZY_SUGGEST_MIN
+        or best_edit_score < FUZZY_EDIT_GATE
+    ):
+        return None
+
+    same_numbers = (
+        _numbers(normalized_query)
+        == _numbers(best_name)
+    )
+
+    if (
+        best_score >= FUZZY_AUTO_MIN
+        and (
+            best_score - second_score >= FUZZY_MARGIN
+            or best_edit_score >= HIGH_CONFIDENCE_EDIT_MIN
+        )
+        and same_numbers   
     ):
         product = _candidate(best_product)
+
         return {
             "success": True,
             "match_type": "typo_corrected",
+            "search_method": "hybrid_bm25_edit_distance",
             "message": (
                 f"'{original_term}'을(를) "
                 f"'{product['product_name']}'(으)로 해석했습니다."
             ),
             "query": original_term,
             "normalized_query": normalized_query,
-            "similarity": round(best_similarity, 3),
+            "similarity": round(best_score, 3),
+            "score_details": {
+                "edit_distance": round(
+                    best_edit_score,
+                    3,
+                ),
+                "bm25": round(
+                    best_bm25_score,
+                    3,
+                ),
+                "hybrid": round(
+                    best_score,
+                    3,
+                ),
+            },
             "product": product,
         }
 
+    candidate_threshold = max(
+        FUZZY_SUGGEST_MIN,
+        best_score - FUZZY_MARGIN,
+    )
+
     suggestions = [
         _candidate(product)
-        for similarity, _, product in scored
-        if similarity >= max(FUZZY_SUGGEST_MIN, best_similarity - FUZZY_MARGIN)
+        for (
+            hybrid_score,
+            edit_score,
+            _,
+            _,
+            product,
+        ) in scored
+        if (
+            hybrid_score >= candidate_threshold
+            and edit_score >= FUZZY_EDIT_GATE
+        )
     ][:MAX_SUGGESTIONS]
 
     return {
         "success": False,
         "error_type": "ambiguous_product",
+        "search_method": "hybrid_bm25_edit_distance",
         "message": (
             f"'{original_term}'과(와) 정확히 일치하는 ETF는 없지만 "
             "비슷한 상품이 있습니다. 어떤 상품인지 확인해 주세요."
         ),
         "query": original_term,
         "normalized_query": normalized_query,
+        "score_details": {
+            "edit_distance": round(
+                best_edit_score,
+                3,
+            ),
+            "bm25": round(
+                best_bm25_score,
+                3,
+            ),
+            "hybrid": round(
+                best_score,
+                3,
+            ),
+        },
         "candidates": suggestions,
     }
 
@@ -193,30 +449,34 @@ def resolve_etf_product(search_term: str) -> dict:
     - 코덱스 200
     - 069500
     → KODEX 200 / 069500
-
-    정확히 일치하는 상품이 없으면 오타 후보를 찾습니다.
-    - COXEX200 → KODEX 200으로 연결
-    - 비슷한 후보가 여러 개면 사용자에게 확인을 요청
     """
 
-    original_term = str(search_term or "").strip()
+    original_term = str(
+        search_term or ""
+    ).strip()
 
     if not original_term:
         return {
             "success": False,
             "error_type": "invalid_query",
-            "message": "ETF 상품명 또는 종목코드를 입력해 주세요.",
+            "message": (
+                "ETF 상품명 또는 종목코드를 입력해 주세요."
+            ),
             "query": original_term,
             "candidates": [],
         }
 
-    normalized_query = normalize_product_key(original_term)
+    normalized_query = normalize_product_key(
+        original_term
+    )
 
     if not normalized_query:
         return {
             "success": False,
             "error_type": "invalid_query",
-            "message": "ETF 상품명을 확인할 수 없습니다.",
+            "message": (
+                "ETF 상품명을 확인할 수 없습니다."
+            ),
             "query": original_term,
             "candidates": [],
         }
@@ -247,25 +507,40 @@ def resolve_etf_product(search_term: str) -> dict:
     finally:
         connection.close()
 
-    return match_products(original_term, products)
+    return match_products(
+        original_term,
+        products,
+    )
 
 
-def match_products(search_term: str, products: list) -> dict:
+def match_products(
+    search_term: str,
+    products: list,
+) -> dict:
     """
-    DB 없이 상품 목록만으로 상품명을 확정합니다. (테스트·평가에서도 사용)
+    상품 목록에서 입력값과 일치하는 상품을 찾습니다.
 
-    1) 종목코드·정식 상품명 정확히 일치
-    2) 상품명 포함 관계
-    3) 위에서 못 찾으면 오타 후보 검색
+    검색 순서:
+    1. 종목코드·정식 상품명 정확히 일치
+    2. 상품명 포함 관계
+    3. 편집 거리와 BM25 하이브리드 검색
     """
-    original_term = str(search_term or "").strip()
-    normalized_query = normalize_product_key(original_term)
+
+    original_term = str(
+        search_term or ""
+    ).strip()
+
+    normalized_query = normalize_product_key(
+        original_term
+    )
 
     if not normalized_query:
         return {
             "success": False,
             "error_type": "invalid_query",
-            "message": "ETF 상품명을 확인할 수 없습니다.",
+            "message": (
+                "ETF 상품명을 확인할 수 없습니다."
+            ),
             "query": original_term,
             "candidates": [],
         }
@@ -292,14 +567,17 @@ def match_products(search_term: str, products: list) -> dict:
         elif (
             normalized_name
             and normalized_name in normalized_query
-            # 'KODEX 200선물인버스2X'처럼 상품명 뒤에 글자가 더 붙으면
-            # 다른 상품일 수 있어 같은 상품으로 보지 않습니다.
-            and normalized_query.split(normalized_name, 1)[1]
-            in ALLOWED_NAME_SUFFIXES
+            and normalized_query.split(
+                normalized_name,
+                1,
+            )[1] in ALLOWED_NAME_SUFFIXES
         ):
             score = 80
 
-        elif normalized_query and normalized_query in normalized_name:
+        elif (
+            normalized_query
+            and normalized_query in normalized_name
+        ):
             score = 70
 
         if score > 0:
@@ -313,6 +591,7 @@ def match_products(search_term: str, products: list) -> dict:
             normalized_query,
             products,
         )
+
         if fuzzy_result is not None:
             return fuzzy_result
 
@@ -366,6 +645,7 @@ def match_products(search_term: str, products: list) -> dict:
     return {
         "success": True,
         "match_type": "exact",
+        "search_method": "exact",
         "message": "ETF 상품을 확인했습니다.",
         "query": original_term,
         "normalized_query": normalized_query,
