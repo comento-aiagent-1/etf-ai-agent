@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # =========================================================
 
 st.set_page_config(
-    page_title="ETF AI 상담센터 베타",
+    page_title="ETF AI 상담센터",
     page_icon="💬",
     layout="centered",
 )
