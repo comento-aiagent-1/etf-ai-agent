@@ -10,6 +10,7 @@ from agent_tools import ETF_AGENT_TOOLS
 from api_tools import EXTERNAL_API_TOOLS
 from news_api import resolve_news_links
 from news_tools import NEWS_TOOLS
+from src.services.conversation_memory import prepare_recent_history
 
 load_dotenv(
     dotenv_path=Path(__file__).resolve().parent / ".env",
@@ -157,7 +158,11 @@ KNOWLEDGE_LEVEL_GUIDANCE = {
 }
 
 
-def run_etf_agent(question, knowledge_level=None):
+def run_etf_agent(
+    question,
+    knowledge_level=None,
+    conversation_history=None,
+):
     """
     사용자 질문을 LangChain 에이전트에 전달하고
     최종 답변과 사용한 도구 목록을 반환합니다.
@@ -199,6 +204,9 @@ def run_etf_agent(question, knowledge_level=None):
                 ),
             }
         )
+    messages.extend(
+        prepare_recent_history(conversation_history)
+    )
     messages.append(
         {
             "role": "user",

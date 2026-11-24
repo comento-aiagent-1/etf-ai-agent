@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 from consultation import consult
 from orchestrator import route_question
+from src.services.conversation_memory import prepare_recent_history
 from streamlit.testing.v1 import AppTest
 
 
@@ -21,6 +22,47 @@ FAQ_RESPONSE = {
 
 
 class ConsultationTest(unittest.TestCase):
+    def test_recent_history_keeps_only_text_from_last_three_turns(self):
+        messages = [
+            {"role": "user", "content": f"질문 {index}", "sources": ["제외"]}
+            if index % 2 == 0
+            else {"role": "assistant", "content": f"답변 {index}", "used_tools": ["제외"]}
+            for index in range(8)
+        ]
+
+        history = prepare_recent_history(messages)
+
+        self.assertEqual(len(history), 6)
+        self.assertEqual(history[0], {"role": "user", "content": "질문 2"})
+        self.assertEqual(history[-1], {"role": "assistant", "content": "답변 7"})
+
+    def test_router_receives_recent_context_for_follow_up_product_reference(self):
+        client = Mock()
+        client.responses.create.return_value.output_text = (
+            '{"routes":["news"],"etf_name":"KODEX 200"}'
+        )
+        history = [
+            {"role": "user", "content": "KODEX 200의 종가를 알려줘"},
+            {"role": "assistant", "content": "기준일 종가는 73,770원입니다."},
+        ]
+
+        result = route_question(
+            "그럼 그 ETF 뉴스는?",
+            client,
+            include_product=True,
+            conversation_history=history,
+        )
+
+        self.assertEqual(
+            result,
+            {"routes": ["news"], "etf_name": "KODEX 200"},
+        )
+        route_input = json.loads(
+            client.responses.create.call_args.kwargs["input"]
+        )
+        self.assertEqual(route_input["recent_conversation"], history)
+        self.assertEqual(route_input["current_question"], "그럼 그 ETF 뉴스는?")
+
     def test_progress_callback_reports_real_processing_stages(self):
         client = Mock()
         client.responses.create.return_value = Mock(
@@ -263,6 +305,21 @@ class ConsultationUiTest(unittest.TestCase):
         self.assertFalse(second.kwargs["selected_faq"])
         self.assertTrue(callable(first.kwargs["progress_callback"]))
         self.assertTrue(callable(second.kwargs["progress_callback"]))
+        self.assertEqual(first.kwargs["conversation_history"], [])
+        self.assertEqual(
+            second.kwargs["conversation_history"],
+            [
+                {"role": "user", "content": QUESTION},
+                {
+                    "role": "assistant",
+                    "content": response["answer"],
+                    "used_tools": response["used_tools"],
+                    "sources": response["sources"],
+                    "related": response["related"],
+                    "selected_faq": True,
+                },
+            ],
+        )
         self.assertEqual(app.session_state["messages"][1]["sources"], response["sources"])
 
         conversation_expanders = [

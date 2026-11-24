@@ -663,6 +663,9 @@ question = (
 
 if question:
     started_at = time.perf_counter()
+    conversation_history = list(
+        st.session_state.messages
+    )
 
     result = "성공"
     used_tools = []
@@ -716,6 +719,7 @@ if question:
                         client,
                         selected_faq=selected_faq,
                         progress_callback=update_progress,
+                        conversation_history=conversation_history,
                     )
 
                 progress_detail.markdown(
