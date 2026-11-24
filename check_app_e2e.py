@@ -33,7 +33,7 @@ def check_app():
         print(f"PASS live flow: {tool}; answer={len(answer['content'])} chars; MongoDB log saved", flush=True)
 
     # Fault injection exercises the app without stopping shared DB services.
-    with patch("langchain_agent.run_etf_agent", return_value={"answer": "E2E retained answer", "used_tools": []}), \
+    with patch("consultation.consult", return_value={"answer": "E2E retained answer", "used_tools": []}), \
          patch("src.services.request_logger.save_request_log", return_value=False):
         app.chat_input[0].set_value("E2E log failure test").run()
         assert not app.exception
@@ -42,7 +42,7 @@ def check_app():
     print("PASS log failure: answer retained and warning rendered", flush=True)
 
     started = datetime.now(timezone.utc)
-    with patch("langchain_agent.run_etf_agent", side_effect=RuntimeError("E2E injected failure")):
+    with patch("consultation.consult", side_effect=RuntimeError("E2E injected failure")):
         app.chat_input[0].set_value("E2E agent failure test").run()
         assert not app.exception
         record = collection.find_one({"created_at": {"$gte": started}})

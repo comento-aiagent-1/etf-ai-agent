@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 
 from dotenv import load_dotenv
@@ -10,16 +11,12 @@ from api_tools import EXTERNAL_API_TOOLS
 from news_api import resolve_news_links
 from news_tools import NEWS_TOOLS
 
-load_dotenv()
+load_dotenv(
+    dotenv_path=Path(__file__).resolve().parent / ".env",
+)
 
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-if not OPENAI_API_KEY:
-    raise RuntimeError(
-        ".env 파일에서 OPENAI_API_KEY를 찾지 못했습니다."
-    )
-
 
 SYSTEM_PROMPT = """
 너는 ETF 질의응답 챗봇의 메인 오케스트레이터 에이전트다.
@@ -74,7 +71,7 @@ search_etf_disclosure를 모두 호출해야 한다.
 - 확인하지 못한 실시간 가격이나 수익률을 말하지 않는다.
 - 특정 상품의 매수 또는 매도를 추천하지 않는다.
 - 투자 판단은 사용자 본인의 책임이라는 점을 지킨다.
-- 초보자가 이해하기 쉬운 한국어로 답변한다.
+- 사용자가 밝힌 배경지식 또는 제공된 설명 수준에 맞춰 어휘와 용어 풀이를 조정한다.
 - 답변은 필요 이상으로 길게 작성하지 않는다.
 - 공시 조회 결과에 원문 URL이 있으면 각 공시 제목과 링크를 반드시 함께 표시한다.
 - 뉴스 조회 결과는 기사마다 한 줄로 "- [기사 제목](url) · 언론사 · 날짜"
@@ -82,27 +79,32 @@ search_etf_disclosure를 모두 호출해야 한다.
   글자 하나 바꾸지 말고 그대로 쓴다. 다른 주소를 만들어 쓰지 않는다.
 - 조회 결과에 포함된 출처 URL을 임의로 생략하지 않는다.
 - 이미 조회한 자료를 두고 나중에 제공하겠다고 답하지 않는다.
+- 질문에 여러 요청이 들어 있으면 각 의도를 나누어 필요한 FAQ·상품·외부 자료 도구를 모두 사용한다.
+- 사용자가 입문자, 초보자 또는 숙련자라고 밝히면 그 수준에 맞춰 설명한다.
+- 수준을 밝히지 않았다면 제공된 설명 수준 안내를 따르고, 해당 수준의 용어와 설명 방식을 사용한다.
 """
 
 
-model = ChatOpenAI(
-    model="gpt-5.4-mini",
-    api_key=OPENAI_API_KEY,
-    use_responses_api=True,
-    reasoning_effort="low",
-    verbosity="low",
-    max_completion_tokens=700,
-    max_retries=2,
-    store=False,
-)
+etf_agent = None
 
+if OPENAI_API_KEY:
+    model = ChatOpenAI(
+        model="gpt-5.4-mini",
+        api_key=OPENAI_API_KEY,
+        use_responses_api=True,
+        reasoning_effort="low",
+        verbosity="low",
+        max_completion_tokens=700,
+        max_retries=2,
+        store=False,
+    )
 
-etf_agent = create_agent(
-    model=model,
-    tools=ETF_AGENT_TOOLS + EXTERNAL_API_TOOLS + NEWS_TOOLS,
-    system_prompt=SYSTEM_PROMPT,
-    name="etf_orchestrator",
-)
+    etf_agent = create_agent(
+        model=model,
+        tools=ETF_AGENT_TOOLS + EXTERNAL_API_TOOLS + NEWS_TOOLS,
+        system_prompt=SYSTEM_PROMPT,
+        name="etf_orchestrator",
+    )
 
 
 def extract_answer(message):
@@ -135,7 +137,27 @@ def extract_answer(message):
     return str(content)
 
 
-def run_etf_agent(question):
+KNOWLEDGE_LEVEL_GUIDANCE = {
+    "입문": (
+        "ETF를 처음 접하는 사용자입니다. 쉬운 일상어와 짧은 예시를 우선하고, "
+        "전문 용어는 쉬운 풀이를 바로 덧붙이세요."
+    ),
+    "초급": (
+        "주식이나 ETF의 기본 개념을 아는 사용자입니다. 매매, 지수, 총보수, "
+        "분배금의 뜻과 실제 투자 과정의 연결을 설명하세요."
+    ),
+    "중급": (
+        "ETF를 실제로 거래하거나 비교해 본 사용자입니다. 추적오차·괴리율·유동성·"
+        "총비용 등 분석 요소와 상품 간 장단점을 중심으로 설명하세요."
+    ),
+    "고급": (
+        "금융상품과 시장구조를 깊이 이해한 사용자입니다. NAV·iNAV·추적오차·"
+        "기초지수 구성과 위험 요인에 대해 지표 정의, 계산 기준, 출처와 한계를 명시하세요."
+    ),
+}
+
+
+def run_etf_agent(question, knowledge_level=None):
     """
     사용자 질문을 LangChain 에이전트에 전달하고
     최종 답변과 사용한 도구 목록을 반환합니다.
@@ -149,16 +171,42 @@ def run_etf_agent(question):
             "used_tools": [],
         }
 
-    result = etf_agent.invoke(
+    if etf_agent is None:
+        return {
+            "answer": (
+                "현재 시연 환경에 OpenAI API 키가 설정되지 않아 "
+                "AI 답변을 생성할 수 없습니다. "
+                ".env 파일에 OPENAI_API_KEY를 설정한 뒤 다시 실행해 주세요."
+            ),
+            "used_tools": [],
+        }
+
+    messages = []
+    if knowledge_level is not None:
+        if knowledge_level not in KNOWLEDGE_LEVEL_GUIDANCE:
+            raise ValueError(
+                f"지원하지 않는 ETF 설명 수준입니다: {knowledge_level}"
+            )
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "사용자의 선택한 설명 수준은 "
+                    f"'{knowledge_level}'입니다. "
+                    f"{KNOWLEDGE_LEVEL_GUIDANCE[knowledge_level]} "
+                    "단, 사용자가 현재 질문에서 다른 배경지식 수준을 "
+                    "명시하면 그 표현을 우선 적용하세요."
+                ),
+            }
+        )
+    messages.append(
         {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": question,
-                }
-            ]
+            "role": "user",
+            "content": question,
         }
     )
+
+    result = etf_agent.invoke({"messages": messages})
 
     messages = result.get("messages", [])
 

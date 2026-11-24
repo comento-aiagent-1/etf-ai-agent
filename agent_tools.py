@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import date
 from decimal import Decimal
 
@@ -6,17 +7,14 @@ from langchain_core.tools import tool
 from psycopg.rows import dict_row
 
 from src.db.postgres import get_database_connection
+from src.services.product_catalog import (
+    apply_brand_aliases,
+    normalize_product_key,
+)
+from src.services.diagnostic_logging import log_safe_exception
 from src.services.vector_search import search_faq_vectors
 
-
-BRAND_ALIASES = {
-    "코덱스": "KODEX",
-    "타이거": "TIGER",
-    "에이스": "ACE",
-    "라이즈": "RISE",
-    "쏠": "SOL",
-    "하나로": "HANARO",
-}
+logger = logging.getLogger(__name__)
 
 
 def json_value(value):
@@ -64,38 +62,6 @@ def normalize_product_values(data):
     }
 
 
-def apply_brand_aliases(text):
-    """
-    사용자가 입력한 한글 ETF 브랜드명을
-    DB의 영문 브랜드명으로 변환합니다.
-    """
-
-    converted = str(text or "").strip()
-
-    for korean_name, english_name in BRAND_ALIASES.items():
-        converted = converted.replace(
-            korean_name,
-            english_name,
-        )
-
-    return converted
-
-
-def normalize_product_key(text):
-    """
-    상품명 비교를 위해 영문 대소문자, 공백,
-    괄호와 특수문자의 영향을 제거합니다.
-    """
-
-    converted = apply_brand_aliases(text).upper()
-
-    return "".join(
-        character
-        for character in converted
-        if character.isalnum()
-    )
-
-
 @tool
 def search_etf_product(search_term: str) -> str:
     """
@@ -120,6 +86,7 @@ def search_etf_product(search_term: str) -> str:
         return json.dumps(
             {
                 "success": False,
+                "error_type": "invalid_query",
                 "message": (
                     "검색할 ETF 상품명이나 "
                     "종목코드가 없습니다."
@@ -142,6 +109,7 @@ def search_etf_product(search_term: str) -> str:
         return json.dumps(
             {
                 "success": False,
+                "error_type": "invalid_query",
                 "message": (
                     "검색어에서 ETF 상품명이나 "
                     "종목코드를 확인하지 못했습니다."
@@ -252,6 +220,7 @@ def search_etf_product(search_term: str) -> str:
             return json.dumps(
                 {
                     "success": False,
+                    "error_type": "product_not_found",
                     "message": (
                         f"'{original_term}'과 일치하는 "
                         "ETF 상품을 DB에서 찾지 못했습니다."
@@ -318,43 +287,19 @@ def search_faq(user_question: str) -> str:
         )
 
     try:
-        results = [
-            remove_empty_values(row)
-            for row in search_faq_vectors(
-                question
-            )
-        ]
-
-    except Exception:
-        return json.dumps(
-            {
-                "success": False,
-                "message": (
-                    "FAQ 벡터 검색을 사용할 수 없습니다. "
-                    "임베딩 생성, API 키와 DB 설정을 "
-                    "확인해 주세요."
-                ),
-                "results": [],
-            },
-            ensure_ascii=False,
+        results = [remove_empty_values(row) for row in search_faq_vectors(question)]
+    except Exception as error:
+        log_safe_exception(
+            logger,
+            "FAQ retrieval",
+            error,
         )
-
-    return json.dumps(
-        {
-            "success": bool(results),
-            "message": (
-                "관련 FAQ를 찾았습니다."
-                if results
-                else (
-                    "관련 FAQ를 찾지 못했습니다. "
-                    "질문을 조금 더 구체적으로 "
-                    "입력해 주세요."
-                )
-            ),
-            "results": results,
-        },
-        ensure_ascii=False,
-    )
+        return json.dumps({"success": False,
+                           "message": "FAQ 벡터 검색을 사용할 수 없습니다. 임베딩 생성, API 키와 DB 설정을 확인해 주세요.",
+                           "results": []}, ensure_ascii=False)
+    return json.dumps({"success": bool(results),
+                       "message": "관련 FAQ를 찾았습니다." if results else "관련 FAQ 벡터가 없습니다. 임베딩 생성 여부를 확인하거나 질문을 구체적으로 입력해 주세요.",
+                       "results": results}, ensure_ascii=False)
 
 
 ETF_AGENT_TOOLS = [

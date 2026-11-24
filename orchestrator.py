@@ -1,27 +1,42 @@
 import json
 
 
-def route_question(question, client):
+def route_question(question, client, *, include_product=False):
+    allowed_routes = ["etf_price", "disclosure", "news", "faq", "clarify"]
+    product_instructions = ""
+    name_schema = {"type": "string"}
+    if include_product:
+        allowed_routes += ["product", "comparison_unsupported"]
+        product_instructions = (
+            "특정 ETF 한 종목의 총보수, 추종지수, 운용사 또는 구성 정보를 묻는 경우 product를 선택하고, "
+            "질문에 있는 상품명 또는 종목코드를 etf_name에 넣는다. "
+            "상품을 임의로 정하지 말고 정보가 부족하면 clarify를 선택한다. "
+            "여러 종목 비교나 조건에 맞는 ETF 목록 검색은 comparison_unsupported를 선택한다. "
+            "일반 개념도 함께 묻는 경우 faq를 추가한다. "
+            "상품정보와 시세 또는 공시를 함께 묻는 경우 필요한 경로를 모두 선택한다."
+        )
     response = client.responses.create(
         model="gpt-5.4-mini",
         instructions=(
             "너는 ETF 챗봇의 메인 오케스트레이터다. "
             "사용자에게 답하지 말고, 질문에 필요한 기능만 선택하라. "
-            "etf_price는 지원 ETF의 종가, NAV, 기준일 질문에 사용한다. "
-            "disclosure는 지원 ETF의 DART 공시 질문에 사용한다. "
+            "etf_price는 특정 ETF의 종가, NAV, 기준일 질문에 사용한다. "
+            "disclosure는 특정 ETF의 DART 공시 질문에 사용한다. "
+            "news는 특정 ETF의 뉴스, 기사, 최근 소식 또는 이슈 질문에 사용한다. "
             "faq는 ETF의 일반 개념과 용어 설명에 사용한다. "
-            "unsupported는 특정 ETF 상품의 시세나 공시를 요청했지만 "
-            "그 상품이 지원 ETF 목록에 없는 경우에 사용한다. "
             "clarify는 어떤 상품을 말하는지 알 수 없거나 "
             "무엇을 묻는지 불분명한 경우에만 사용한다. "
-            "예를 들어 '달토끼 우주여행 ETF의 종가'는 unsupported이고, "
-            "'ETF 가격 알려줘'는 clarify다. "
+            "존재 여부가 의심되는 상품도 라우터가 임의로 차단하지 말고, "
+            "질문에 적힌 상품명 또는 종목코드를 그대로 etf_name에 넣어 "
+            "시세·공시·뉴스 도구가 상품 DB에서 확인하게 한다. "
+            "예를 들어 '달토끼 우주여행 ETF의 종가'는 etf_price이고, "
+            "'ETF 가격 알려줘'처럼 상품명이 없는 질문만 clarify다. "
             "종가와 공시를 모두 요청하면 두 경로를 모두 선택한다. "
-            "지원 ETF는 KODEX 200과 "
-            "KODEX 인도Nifty미드캡100뿐이다. "
-            "지원하지 않는 상품의 etf_name은 none으로 설정하라. "
+            "종가와 뉴스를 모두 요청하면 etf_price와 news를 모두 선택한다. "
+            "etf_name은 질문에 나타난 표현을 그대로 사용하고, "
+            "상품명이 없을 때만 none을 사용한다. "
             "자료 조회 결과나 수치를 만들어내지 마라."
-        ),
+        ) + product_instructions,
         input=question,
         text={
             "format": {
@@ -35,23 +50,10 @@ def route_question(question, client):
                             "type": "array",
                             "items": {
                                 "type": "string",
-                                "enum": [
-                                    "etf_price",
-                                    "disclosure",
-                                    "faq",
-                                    "unsupported",
-                                    "clarify",
-                                ],
+                                "enum": allowed_routes,
                             },
                         },
-                        "etf_name": {
-                            "type": "string",
-                            "enum": [
-                                "KODEX 200",
-                                "KODEX 인도Nifty미드캡100",
-                                "none",
-                            ],
-                        },
+                        "etf_name": name_schema,
                     },
                     "required": ["routes", "etf_name"],
                     "additionalProperties": False,
@@ -73,12 +75,14 @@ def route_question(question, client):
     if not routes:
         routes = ["clarify"]
 
-    if etf_name == "none" and any(
-        route in routes for route in ["etf_price", "disclosure"]
-    ):
-        routes = ["clarify"]
+    etf_name = etf_name.strip() or "none"
+
+    data_routes = {"etf_price", "disclosure", "news", "product"}
+    if etf_name == "none" and data_routes.intersection(routes):
+        routes = [route for route in routes if route not in data_routes]
+        routes.append("clarify")
 
     return {
-        "routes": routes,
+        "routes": list(dict.fromkeys(routes)),
         "etf_name": etf_name,
     }
