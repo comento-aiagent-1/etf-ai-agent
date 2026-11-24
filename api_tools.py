@@ -17,6 +17,10 @@ def _resolution_error(resolution):
     return json.dumps(
         {
             "success": False,
+            "error_type": resolution.get(
+                "error_type",
+                "product_resolution_failed",
+            ),
             "message": resolution.get(
                 "message",
                 "ETF 상품을 확인하지 못했습니다.",

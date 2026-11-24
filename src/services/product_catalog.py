@@ -59,6 +59,7 @@ def resolve_etf_product(search_term: str) -> dict:
     if not original_term:
         return {
             "success": False,
+            "error_type": "invalid_query",
             "message": "ETF 상품명 또는 종목코드를 입력해 주세요.",
             "query": original_term,
             "candidates": [],
@@ -69,6 +70,7 @@ def resolve_etf_product(search_term: str) -> dict:
     if not normalized_query:
         return {
             "success": False,
+            "error_type": "invalid_query",
             "message": "ETF 상품명을 확인할 수 없습니다.",
             "query": original_term,
             "candidates": [],
@@ -133,6 +135,7 @@ def resolve_etf_product(search_term: str) -> dict:
     if not scored_products:
         return {
             "success": False,
+            "error_type": "product_not_found",
             "message": (
                 f"'{original_term}'과 일치하는 ETF를 "
                 "상품 DB에서 찾지 못했습니다."
@@ -160,6 +163,7 @@ def resolve_etf_product(search_term: str) -> dict:
     if len(best_products) > 1:
         return {
             "success": False,
+            "error_type": "ambiguous_product",
             "message": (
                 "여러 ETF가 검색되었습니다. "
                 "정확한 상품명이나 종목코드를 입력해 주세요."
