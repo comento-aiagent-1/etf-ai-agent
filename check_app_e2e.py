@@ -23,10 +23,12 @@ def check_app():
         assert answer["role"] == "assistant"
         assert tool in answer["used_tools"], answer
         assert answer_part in answer["content"], answer
-        records = list(collection.find({"question": question, "created_at": {"$gte": started}}))
+        records = list(collection.find({"created_at": {"$gte": started}}))
         assert len(records) == 1, f"Expected exactly one log, got {len(records)}"
         assert records[0]["status"] == "success", records[0]["result"]
         assert tool in records[0]["used_tools"]
+        assert "question" not in records[0], "Question text must not be logged"
+        assert records[0]["question_length"] == len(question)
         assert not app.warning
         print(f"PASS live flow: {tool}; answer={len(answer['content'])} chars; MongoDB log saved", flush=True)
 
@@ -43,7 +45,7 @@ def check_app():
     with patch("langchain_agent.run_etf_agent", side_effect=RuntimeError("E2E injected failure")):
         app.chat_input[0].set_value("E2E agent failure test").run()
         assert not app.exception
-        record = collection.find_one({"question": "E2E agent failure test", "created_at": {"$gte": started}})
+        record = collection.find_one({"created_at": {"$gte": started}})
         assert record and record["status"] == "error"
         assert record["error_type"] == "RuntimeError"
     print("PASS agent failure: error response and MongoDB error log", flush=True)

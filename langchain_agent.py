@@ -169,6 +169,8 @@ def run_etf_agent(question):
         }
 
     used_tools = []
+    # 로그 요약용: 에이전트가 어떤 도구를 어떤 입력으로 불렀는지 모읍니다.
+    tool_inputs = []
 
     for message in messages:
         message_type = getattr(message, "type", "")
@@ -179,10 +181,19 @@ def run_etf_agent(question):
             if tool_name and tool_name not in used_tools:
                 used_tools.append(tool_name)
 
+        for call in getattr(message, "tool_calls", None) or []:
+            tool_inputs.append(
+                {
+                    "tool": call.get("name"),
+                    "args": call.get("args") or {},
+                }
+            )
+
     final_message = messages[-1]
     answer = resolve_news_links(extract_answer(final_message))
 
     return {
         "answer": answer,
         "used_tools": used_tools,
+        "tool_inputs": tool_inputs,
     }
