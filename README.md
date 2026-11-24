@@ -1,6 +1,145 @@
 # ETF AI 상담센터
 
+## Docker로 앱 실행
+
+처음 실행할 때 `.env.example`을 `.env`로 복사하고 API 키를 입력합니다.
+기존 `.env`가 있으면 그대로 사용합니다. Docker Desktop이 실행 중이어야 합니다.
+
+```bash
+docker compose up -d --build --wait
+docker compose ps
+docker compose logs --tail=50 app
+```
+
+접속: http://localhost:8501
+
+- 앱은 `infra/Dockerfile`로 빌드하며 PostgreSQL·MongoDB가 준비되면 시작합니다.
+- 컨테이너의 DB 호스트와 포트는 Compose가 서비스 이름과 내부 포트로 설정합니다.
+- `.env`와 Streamlit secrets는 이미지에 포함되지 않습니다. 환경변수는 실행할 때 주입합니다.
+- `data/source`는 이미지에 포함되며, `data/cache`와 `logs`는 호스트 폴더에 보존됩니다.
+- DB는 기존 named volume에 보존됩니다. 데이터를 유지하려면 `docker compose down -v`를 사용하지 마세요.
+- 소스를 변경한 뒤에는 위 명령으로 다시 빌드합니다. 코드 폴더는 마운트하지 않습니다.
+- 8501은 로컬 인터페이스에만 공개됩니다. Azure에서는 호스트 Nginx가 이 포트로 프록시합니다.
+- CORS·XSRF 보호는 활성화되어 있습니다. HTTPS 프록시에는 WebSocket 헤더 전달 설정이 추가로 필요합니다.
+- 직접 의존성은 로컬 환경의 버전으로 고정했습니다. 전이 의존성까지 고정한 lock 파일은 아닙니다.
+
+새 DB에 최초 데이터를 넣을 때만 다음 순서로 실행합니다. 임베딩 생성은 OpenAI API를 호출합니다.
+
+```bash
+docker compose exec app python build_database.py
+docker compose exec app python build_embeddings.py
+```
+
+앱 중지: `docker compose stop app`. 전체 서비스 중지: `docker compose stop`.
+
 > 사용자 질문을 분석하고 ETF 상품 DB·FAQ·시세·공시·뉴스를 조회하여 근거와 출처가 포함된 답변을 제공하는 AI 에이전트 챗봇
+
+## Azure 운영 Compose와 데이터 보존
+
+### GitHub Actions에서 이미지 게시
+
+`.github/workflows/deploy.yml`은 `dev`·`main` push 시 이미지를 빌드하고,
+그 이미지 안에서 외부 네트워크 없이 단위 테스트를 실행한 뒤 GHCR에 게시합니다.
+PR에서는 빌드·테스트만 실행합니다. 수동 실행도 가능하지만 이미지는 `dev`·`main`에서만 게시합니다.
+현재 단계는 이미지 게시까지이며 Azure SSH 자동 배포는 아직 포함하지 않습니다.
+
+- 별도 API 키나 PAT를 GitHub Secrets에 등록할 필요가 없습니다. 게시에는 자동 제공되는 `GITHUB_TOKEN`과 `packages: write` 권한을 사용합니다.
+- 조직 정책에서 Actions와 패키지 생성을 허용해야 합니다. 기존 패키지에 게시 권한 오류가 나면 패키지 설정의 Manage Actions access에서 이 저장소에 쓰기 권한을 부여합니다.
+- 이미지 경로: `ghcr.io/comento-aiagent-1/etf-ai-agent:<40자리 커밋 SHA>`.
+- 성공한 Actions 실행의 Summary에서 `APP_IMAGE=...` 값을 복사해 VM `.env`에 넣습니다.
+- `latest` 태그는 게시하지 않습니다. 운영 반영할 커밋의 SHA를 직접 선택합니다.
+- private GHCR 이미지라면 VM에서 `read:packages` 권한의 PAT(classic)로 먼저 로그인해야 합니다. 조직 SSO가 있다면 토큰 승인도 필요합니다.
+
+```bash
+# Azure Bash: GitHub 사용자명과 PAT를 대화형으로 입력 (토큰은 화면에 표시하지 않음)
+read -r -p 'GitHub username: ' GHCR_USER
+read -r -s -p 'GHCR read token: ' GHCR_READ_TOKEN
+printf '\n'
+printf '%s' "$GHCR_READ_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+unset GHCR_READ_TOKEN
+```
+
+로그인은 배포 명령과 같은 Linux 사용자로 수행합니다. 실제 API 키는 VM의 `.env`에만 보관합니다.
+
+`compose.prod.yaml`은 독립된 운영 설정입니다. 로컬 `compose.yaml`과 합쳐 실행하지 않습니다.
+아래 명령은 **Azure Ubuntu의 Bash**에서 실행합니다. GHCR에 이미지가 게시된 이후에 사용합니다.
+
+배포 폴더 `/opt/etf-ai-agent`에는 다음 파일이 필요합니다.
+
+```text
+compose.prod.yaml
+.env                   # .env.prod.example을 복사하고 실제 값을 입력
+database/schema.sql
+```
+
+`.env`의 `APP_IMAGE`에 GHCR 이미지의 커밋 SHA 태그를 지정하고 API 키와 새 DB 비밀번호를 입력합니다.
+비밀번호가 빈 값이면 Compose가 실행을 거부합니다. `$`, `#`가 포함된 값은 작은따옴표로 감쌉니다.
+운영 자격증명은 Git 또는 이미지에 넣지 않습니다. 개인 GHCR 패키지는 VM에서 먼저 `docker login ghcr.io`가 필요합니다.
+
+```bash
+cd /opt/etf-ai-agent
+chmod 600 .env
+docker compose -f compose.prod.yaml config --quiet
+docker compose -f compose.prod.yaml pull
+docker compose -f compose.prod.yaml up -d --no-build --wait
+docker compose -f compose.prod.yaml ps
+curl -fsS http://127.0.0.1:8501/_stcore/health
+```
+
+- 프로젝트 이름은 `etf-ai-agent-prod`로 고정되어 폴더 이름 변경에도 볼륨 이름이 유지됩니다. 운영에서 `-p`나 `COMPOSE_PROJECT_NAME`으로 바꾸지 마세요.
+- PostgreSQL·벡터는 `etf-ai-agent-prod_postgres_data`, MongoDB는 `etf-ai-agent-prod_mongo_data`와 `etf-ai-agent-prod_mongo_config`에 저장됩니다.
+- 캐시·파일 로그는 `etf-ai-agent-prod_app_cache`, `etf-ai-agent-prod_app_logs`에 저장됩니다. 새 볼륨은 이미지 디렉터리의 UID 10001 소유권을 이어받습니다.
+- DB 포트는 호스트에 공개하지 않습니다. 앱만 `127.0.0.1:8501`에 연결하며 이후 호스트 Nginx에서 접근합니다.
+- 컨테이너 출력 로그는 서비스별 파일 10MB × 3개로 순환합니다. 앱 로그 볼륨의 파일은 별도 보관 정책이 필요합니다.
+- 기존 볼륨이 있으면 `.env` 수정만으로 DB 이름·사용자·비밀번호가 변경되지 않습니다. DB 내부 변경과 앱 설정 변경을 함께 진행해야 합니다.
+- `database/schema.sql`은 빈 PostgreSQL 볼륨의 최초 초기화 때만 실행됩니다. 이후 스키마 변경은 백업 후 별도 마이그레이션으로 적용합니다.
+- 새 운영 DB에는 상품·FAQ·벡터가 없습니다. 최초 1회 데이터 적재·임베딩 생성 또는 기존 DB 백업 복원이 필요합니다.
+
+### 재배포와 보존 확인
+
+`.env`의 `APP_IMAGE`를 새 SHA로 변경한 뒤 앱만 갱신합니다.
+
+```bash
+docker compose -f compose.prod.yaml pull app
+docker compose -f compose.prod.yaml up -d --no-deps --no-build --wait app
+```
+
+전후 상품·FAQ·벡터 개수와 MongoDB 요청 로그를 비교하고 실제 질문으로 확인합니다.
+문제가 있으면 `APP_IMAGE`를 이전 SHA로 되돌리고 같은 명령을 실행합니다. DB 스키마 변경은 이미지 롤백과 별개입니다.
+`stop`, `down`과 컨테이너 재생성은 named volume을 유지합니다. **`down -v`나 해당 볼륨 삭제는 데이터를 지웁니다.**
+볼륨은 백업이 아니며 VM·디스크 삭제에 대비해 백업을 VM 외부에도 보관해야 합니다.
+
+### DB 백업과 복원
+
+아래는 쓰기 작업을 잠시 멈춘 상태에서 두 DB를 백업하는 예시입니다. 수동 적재·임베딩 작업도 중지합니다.
+PostgreSQL은 앱 DB 전체, MongoDB는 인증정보를 포함한 전체 DB를 백업하므로 파일 접근을 제한합니다.
+
+```bash
+cd /opt/etf-ai-agent
+set -e
+umask 077
+backup_dir="backups/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$backup_dir"
+docker compose -f compose.prod.yaml stop app
+trap 'docker compose -f compose.prod.yaml start app' EXIT
+docker compose -f compose.prod.yaml exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$backup_dir/postgres.dump"
+docker compose -f compose.prod.yaml exec -T mongodb sh -c 'mongodump --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --archive --gzip' > "$backup_dir/mongodb.archive.gz"
+docker compose -f compose.prod.yaml start app
+trap - EXIT
+```
+
+백업 파일을 별도 Azure Blob Storage 등으로 복사하고 정기적으로 복원 검증합니다.
+복원은 **새 격리 환경의 빈 DB**에서 먼저 수행합니다. 기존 데이터에 덮어쓰지 마세요.
+PostgreSQL 초기화가 만든 스키마와 충돌하지 않도록 새 대상 DB를 비운 뒤 다음을 실행합니다.
+이때 DB 이름·비밀번호 등은 복원 대상 환경의 `.env`를 사용합니다.
+
+```bash
+# 빈 복원 대상 DB에서만 실행 (Bash)
+docker compose -f compose.prod.yaml exec -T postgres sh -c 'pg_restore --exit-on-error --no-owner --no-privileges -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < "$backup_dir/postgres.dump"
+docker compose -f compose.prod.yaml exec -T mongodb sh -c 'mongorestore --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --archive --gzip --nsExclude="admin.*" --nsExclude="config.*" --nsExclude="local.*"' < "$backup_dir/mongodb.archive.gz"
+```
+
+MongoDB 복원은 대상 환경의 관리자 계정을 유지합니다. 앱 DB 이름을 변경했다면 MongoDB 복원 시 `--nsFrom`·`--nsTo`로 이름을 매핑해야 합니다.
 
 코멘토 AI 에이전트 개발 부트캠프 팀 프로젝트입니다.
 
