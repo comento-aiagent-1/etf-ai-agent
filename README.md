@@ -41,7 +41,9 @@ docker compose exec app python build_embeddings.py
 `.github/workflows/deploy.yml`은 `dev`·`main` push 시 이미지를 빌드하고,
 그 이미지 안에서 외부 네트워크 없이 단위 테스트를 실행한 뒤 GHCR에 게시합니다.
 PR에서는 빌드·테스트만 실행합니다. 수동 실행도 가능하지만 이미지는 `dev`·`main`에서만 게시합니다.
-현재 단계는 이미지 게시까지이며 Azure SSH 자동 배포는 아직 포함하지 않습니다.
+`dev`에서 `main`으로 PR을 병합하면 `main` push 이벤트로 이미지 게시 후 Azure SSH 배포를 실행합니다.
+`dev` push는 이미지 게시까지만 수행하며, PR과 수동 실행에서는 운영 배포하지 않습니다.
+배포 조건은 `main` push로 고정되어 있습니다. 직접 push도 배포되므로 `main` 브랜치를 PR 병합만 허용하도록 보호하세요.
 
 - 별도 API 키나 PAT를 GitHub Secrets에 등록할 필요가 없습니다. 게시에는 자동 제공되는 `GITHUB_TOKEN`과 `packages: write` 권한을 사용합니다.
 - 조직 정책에서 Actions와 패키지 생성을 허용해야 합니다. 기존 패키지에 게시 권한 오류가 나면 패키지 설정의 Manage Actions access에서 이 저장소에 쓰기 권한을 부여합니다.
@@ -60,6 +62,60 @@ unset GHCR_READ_TOKEN
 ```
 
 로그인은 배포 명령과 같은 Linux 사용자로 수행합니다. 실제 API 키는 VM의 `.env`에만 보관합니다.
+
+### Azure SSH 자동 배포 최초 설정
+
+자동 배포는 기존 `/opt/etf-ai-agent/compose.prod.yaml`과 `.env`를 사용합니다.
+VM에서 첫 수동 배포와 해당 Linux 사용자의 GHCR 로그인을 완료해야 합니다.
+VM에 Bash, Python 3, flock, Docker Compose가 필요합니다. Ubuntu 기본 구성과 앞의 설치 절차를 기준으로 합니다.
+워크플로는 DB·Nginx·스키마를 갱신하지 않고 앱만 교체합니다. 운영 Compose 변경은 별도 검토 후 VM에 반영하세요.
+
+**1. GitHub Environment:** 저장소 Settings → Environments에서 `production`을 생성하고,
+Deployment branches and tags에서 Selected branches and tags를 선택하고 Branch `main`만 허용합니다. 기존 `dev` 허용 규칙은 제거하세요.
+
+**2. Azure OIDC:** Azure Portal → Microsoft Entra ID → App registrations에서 배포용 앱을 등록합니다.
+Certificates & secrets → Federated credentials → Add credential → GitHub Actions를 선택합니다.
+Organization=`comento-aiagent-1`, Repository=`etf-ai-agent`, Entity type=`Environment`, Environment=`production`으로 설정합니다.
+Subject는 `repo:comento-aiagent-1/etf-ai-agent:environment:production`, Audience는 `api://AzureADTokenExchange`입니다.
+Client secret은 만들지 않습니다. 앱 등록·역할 할당이 구독 정책상 제한되면 Azure 관리자에게 해당 설정을 요청해야 합니다.
+VM에 연결된 NSG → Access control (IAM)에서 이 앱의 서비스 주체에 **Network Contributor** 역할을
+**해당 NSG 리소스 범위로만** 부여합니다. 전체 구독 범위 권한은 필요하지 않습니다.
+
+**3. GitHub Environment `production`의 Secrets:**
+
+| 이름 | 값 |
+| --- | --- |
+| `VM_HOST` | `4.230.18.14` |
+| `VM_USER` | `azureuser` |
+| `SSH_PRIVATE_KEY` | 해당 VM에 등록된 SSH 개인 키 전체 (BEGIN/END 줄 포함) |
+| `SSH_KNOWN_HOSTS` | 신뢰하는 경로로 확인한 서버 호스트 공개 키 한 줄 |
+| `AZURE_CLIENT_ID` | 앱 등록의 Application (client) ID |
+| `AZURE_TENANT_ID` | Directory (tenant) ID |
+| `AZURE_SUBSCRIPTION_ID` | Azure for Students 구독 ID |
+
+이미 신뢰하고 접속한 VM의 Ubuntu 터미널에서 다음으로 `SSH_KNOWN_HOSTS` 값을 만듭니다.
+이 파일은 서버 **공개 키**이며 클라이언트 개인 키와 다릅니다.
+
+```bash
+printf '4.230.18.14 '
+cut -d ' ' -f 1,2 /etc/ssh/ssh_host_ed25519_key.pub
+```
+
+**4. Environment Variables:** `AZURE_NSG_NAME`과 `AZURE_NSG_RESOURCE_GROUP`에 VM에 연결된
+NSG 이름과 그 NSG의 리소스 그룹 이름을 등록합니다. 기존 `DEPLOY_BRANCH` 변수가 있다면 삭제해도 됩니다. 워크플로에서 사용하지 않습니다.
+
+GitHub 호스팅 runner IP는 실행마다 달라집니다. 워크플로는 OIDC로 Azure에 인증하고 runner의 IPv4 `/32`만
+허용하는 임시 SSH 규칙을 생성한 뒤 배포 후 제거합니다. 내 IP의 기존 SSH 규칙은 유지합니다.
+서브넷에 별도 NSG가 있거나 UFW에서 SSH를 내 IP로만 제한했다면 추가 네트워크 구성이 필요합니다.
+임시 규칙은 빈 우선순위 3000~3999를 사용하므로 더 높은 우선순위의 차단 규칙이 없어야 합니다.
+runner 강제 종료나 Azure 장애로 정리가 실패하면 NSG의 `gha-ssh-<run_id>-<attempt>` 규칙을 수동으로 제거하세요.
+
+**5. 검증:** `dev` PR 병합 시 `image`만 실행되고 `deploy`는 skipped인지 확인합니다.
+이후 `dev` → `main` PR을 병합하면 Actions의 `image`와 `deploy`가 모두 성공하는지 확인합니다.
+배포는 이미지를 내려받고 앱만 재생성하여 healthcheck를 기다립니다. 성공 후 `.env`의 `APP_IMAGE`만 갱신하며,
+실패하면 이전 로컬 이미지로 롤백을 시도하고 작업을 실패 처리합니다. DB 볼륨과 API 키는 유지합니다.
+healthcheck는 프로세스 준비 상태 검사이며 실제 RAG 질의 성공을 보장하지 않으므로 HTTPS 화면에서도 질문을 확인하세요.
+컨테이너 교체 시 기존 채팅 세션이 끊길 수 있습니다. 동시에 두 배포가 실행되지 않도록 직렬화되어 있습니다.
 
 `compose.prod.yaml`은 독립된 운영 설정입니다. 로컬 `compose.yaml`과 합쳐 실행하지 않습니다.
 아래 명령은 **Azure Ubuntu의 Bash**에서 실행합니다. GHCR에 이미지가 게시된 이후에 사용합니다.
