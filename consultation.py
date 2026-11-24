@@ -65,6 +65,8 @@ def consult(
     related = []
     notices = []
     used_tools = []
+    # 로그 요약용: 어떤 도구를 어떤 상품명으로 불렀는지 (질문 원문은 넣지 않음)
+    tool_inputs = []
 
     for route in routes["routes"]:
         if route == "faq":
@@ -74,6 +76,7 @@ def consult(
                 "ETF FAQ DB에서 관련 내용을 확인하고 있어요.",
             )
             used_tools.append("search_faq")
+            tool_inputs.append({"tool": "search_faq", "args": {}})
             faq = run_faq_agent(question)
             if faq["success"]:
                 evidence["faq"] = faq["results"]
@@ -92,6 +95,9 @@ def consult(
                 f"{label} 자료를 확인하고 있어요.",
             )
             used_tools.append(tool.name)
+            tool_inputs.append(
+                {"tool": tool.name, "args": {argument: routes["etf_name"]}}
+            )
             try:
                 payload = json.loads(tool.invoke({argument: routes["etf_name"]}))
                 if payload.get("success") is True:
@@ -178,4 +184,5 @@ def consult(
         "used_tools": used_tools,
         "sources": [source for source in sources if source],
         "related": list(dict.fromkeys(related)),
+        "tool_inputs": tool_inputs,
     }

@@ -3,6 +3,7 @@ import logging
 import os
 import time
 from pathlib import Path
+from uuid import uuid4
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -224,6 +225,10 @@ if not api_key:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# 로그용 가명 대화 ID: 실제 사용자와 연결되지 않는 무작위 값
+if "log_session_id" not in st.session_state:
+    st.session_state.log_session_id = uuid4().hex
+
 if "faq_view_category" not in st.session_state:
     st.session_state.faq_view_category = None
 
@@ -260,6 +265,7 @@ with st.sidebar:
         width="stretch",
     ):
         st.session_state.messages = []
+        st.session_state.log_session_id = uuid4().hex
         st.session_state.faq_view_category = None
         st.rerun()
 
@@ -660,6 +666,7 @@ if question:
 
     result = "성공"
     used_tools = []
+    tool_inputs = []
     sources = []
     related = []
     status = "success"
@@ -731,6 +738,11 @@ if question:
             )
             sources = agent_result.get("sources", [])
             related = agent_result.get("related", [])
+
+            tool_inputs = agent_result.get(
+                "tool_inputs",
+                [],
+            )
 
             if not answer.strip():
                 answer = (
@@ -807,12 +819,14 @@ if question:
         - started_at
     )
 
-    # 응답시간 기록
+    # 응답시간 기록 (질문 원문 대신 길이와 요약만 저장)
     if not save_request_log(
-        question=question,
+        question_length=len(question),
         elapsed_seconds=elapsed_seconds,
         result=result,
         used_tools=used_tools,
+        tool_inputs=tool_inputs,
+        session_id=st.session_state.log_session_id,
         status=status,
         error_type=error_type,
     ):
