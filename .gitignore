@@ -1,6 +1,10 @@
 data/cache/
 .venv/
 .env
+.env.*
+!.env.example
+!.env.prod.example
+backups/
 __pycache__/
 *.pyc
 logs/
