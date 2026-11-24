@@ -3,6 +3,7 @@
 기사를 가져오는 부분은 news_api.py에 있습니다.
 """
 import json
+import os
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -17,6 +18,11 @@ from news_api import (
     register_news_link,
 )
 from src.services.product_catalog import resolve_etf_product
+from src.services.ttl_cache import TTLCache
+
+
+NEWS_CACHE_SECONDS = int(os.getenv("NEWS_CACHE_SECONDS", "600"))
+_NEWS_CACHE = TTLCache(maxsize=128)
 
 
 def _resolution_error(resolution):
@@ -122,7 +128,11 @@ def search_etf_news(etf_name: str) -> str:
     canonical_name = product["product_name"]
 
     try:
-        result = find_etf_news(canonical_name)
+        result, cache_hit = _NEWS_CACHE.get_or_set(
+            ("news", canonical_name),
+            lambda: find_etf_news(canonical_name),
+            ttl_seconds=NEWS_CACHE_SECONDS,
+        )
 
     except NewsFetchError:
         return json.dumps(
@@ -178,6 +188,7 @@ def search_etf_news(etf_name: str) -> str:
                 "end_date": result["end_date"],
             },
             "checked_at": result["checked_at"],
+            "cache_hit": cache_hit,
             "articles": result["articles"],
             "notice": (
                 "기사 제목·언론사·날짜만 확인한 자료입니다. "

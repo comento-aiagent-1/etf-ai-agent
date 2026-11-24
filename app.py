@@ -259,7 +259,6 @@ if "faq_view_category" not in st.session_state:
 
 selected_question = None
 selected_faq = False
-requested_level = None
 faq_rows = load_faq_questions()
 
 # =========================================================
@@ -405,15 +404,6 @@ with st.sidebar:
 
     st.divider()
     latest = st.session_state.messages[-1] if st.session_state.messages else {}
-    if questions and latest.get("role") == "assistant":
-        easy, detailed = st.columns(2)
-        if easy.button("더 쉽게", width="stretch"):
-            requested_level = "입문"
-        if detailed.button("더 자세히", width="stretch"):
-            requested_level = "고급"
-        if requested_level:
-            selected_question = questions[-1]
-            selected_faq = latest.get("selected_faq", False)
     related = latest.get("related", [])
     if related:
         st.subheader("관련 FAQ")
@@ -718,6 +708,9 @@ if question:
     result = "성공"
     used_tools = []
     tool_inputs = []
+    stage_timings = {}
+    cache_hits = {}
+    router_mode = None
     sources = []
     related = []
     status = "success"
@@ -782,11 +775,10 @@ if question:
                     )
                     progress_detail.markdown(detail)
 
-                level = requested_level or knowledge_level
                 with OpenAI(timeout=20, max_retries=0) as client:
                     agent_result = consult(
                         question,
-                        level,
+                        knowledge_level,
                         client,
                         selected_faq=selected_faq,
                         progress_callback=update_progress,
@@ -818,6 +810,18 @@ if question:
                 "tool_inputs",
                 [],
             )
+
+            stage_timings = agent_result.get(
+                "timings",
+                {},
+            )
+
+            cache_hits = agent_result.get(
+                "cache_hits",
+                {},
+            )
+
+            router_mode = agent_result.get("router_mode")
 
             if not answer.strip():
                 answer = (
@@ -895,16 +899,30 @@ if question:
     )
 
     # 응답시간 기록 (질문 원문 대신 길이와 요약만 저장)
-    if not save_request_log(
-        question_length=len(question),
-        elapsed_seconds=elapsed_seconds,
-        result=result,
-        used_tools=used_tools,
-        tool_inputs=tool_inputs,
-        session_id=st.session_state.log_session_id,
-        status=status,
-        error_type=error_type,
-    ):
+    # 로깅 코드 오류나 DB 장애가 사용자 답변을 중단시키지 않게 합니다.
+    try:
+        log_saved = save_request_log(
+            question_length=len(question),
+            elapsed_seconds=elapsed_seconds,
+            result=result,
+            used_tools=used_tools,
+            tool_inputs=tool_inputs,
+            session_id=st.session_state.log_session_id,
+            status=status,
+            error_type=error_type,
+            stage_timings=stage_timings,
+            cache_hits=cache_hits,
+            router_mode=router_mode,
+        )
+    except Exception as error:
+        log_safe_exception(
+            logger,
+            "Request log write",
+            error,
+        )
+        log_saved = False
+
+    if not log_saved:
         st.session_state["log_save_failed"] = True
 
     st.session_state["scroll_target"] = "latest"
