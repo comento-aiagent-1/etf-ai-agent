@@ -1,6 +1,8 @@
-streamlit
-openai
-python-dotenv
-requests
-langchain
-langchain-openai
+streamlit==1.67.0
+openai==3.52.0
+python-dotenv==1.2.4
+requests==2.34.2
+langchain==1.5.0
+langchain-openai==1.8.0
+psycopg[binary]==3.3.9
+pymongo==4.20.0

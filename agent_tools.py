@@ -1,70 +1,202 @@
 import json
-import re
-import sqlite3
-from pathlib import Path
+import logging
+from datetime import date
+from decimal import Decimal
 
 from langchain_core.tools import tool
+from psycopg.rows import dict_row
+
+from src.db.postgres import get_database_connection
+from src.services.diagnostic_logging import log_safe_exception
+from src.services.vector_search import search_faq_vectors
+
+logger = logging.getLogger(__name__)
 
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "data" / "etf_chatbot.db"
+BRAND_ALIASES = {
+    "코덱스": "KODEX",
+    "타이거": "TIGER",
+    "에이스": "ACE",
+    "라이즈": "RISE",
+    "쏠": "SOL",
+    "하나로": "HANARO",
+}
 
 
-def get_database_connection():
-    """SQLite DB에 연결합니다."""
+def json_value(value):
+    """날짜와 Decimal 값을 JSON으로 변환할 수 있게 정리합니다."""
 
-    if not DB_PATH.exists():
-        raise RuntimeError(
-            "ETF 챗봇 DB를 찾을 수 없습니다. "
-            "먼저 build_database.py를 실행해 주세요."
-        )
+    if isinstance(value, date):
+        return value.isoformat()
 
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
+    if isinstance(value, Decimal):
+        return float(value)
 
-    return connection
+    return value
 
 
 def remove_empty_values(data):
-    """조회 결과에서 비어 있는 값을 제외합니다."""
+    """
+    FAQ 결과 등에서 기존과 동일하게
+    비어 있는 값을 제외합니다.
+    """
 
     return {
-        key: value
+        key: json_value(value)
         for key, value in data.items()
         if value not in (None, "")
     }
 
 
+def normalize_product_values(data):
+    """
+    ETF 상품 DB의 빈 필드를 삭제하지 않고
+    '미확인'으로 명시합니다.
+    """
+
+    return {
+        key: (
+            "미확인"
+            if value is None
+            or (
+                isinstance(value, str)
+                and not value.strip()
+            )
+            else json_value(value)
+        )
+        for key, value in data.items()
+    }
+
+
+def apply_brand_aliases(text):
+    """
+    사용자가 입력한 한글 ETF 브랜드명을
+    DB의 영문 브랜드명으로 변환합니다.
+    """
+
+    converted = str(text or "").strip()
+
+    for korean_name, english_name in BRAND_ALIASES.items():
+        converted = converted.replace(
+            korean_name,
+            english_name,
+        )
+
+    return converted
+
+
+def normalize_product_key(text):
+    """
+    상품명 비교를 위해 영문 대소문자, 공백,
+    괄호와 특수문자의 영향을 제거합니다.
+    """
+
+    converted = apply_brand_aliases(text).upper()
+
+    return "".join(
+        character
+        for character in converted
+        if character.isalnum()
+    )
+
+
 @tool
 def search_etf_product(search_term: str) -> str:
     """
-    ETF 상품명 또는 6자리 종목코드로 ETF 상품 DB를 검색한다.
+    ETF 상품명, 상품명 일부 또는 종목코드로
+    PostgreSQL ETF 상품 DB를 검색한다.
 
-    상품의 운용사, 자산 유형, 기초지수, 총보수, 위험등급,
-    상장일, 구성종목과 자료 출처가 필요할 때 사용한다.
+    상품의 운용사, 자산 유형, 기초지수, 총보수,
+    위험등급, 상장일, 구성종목과 자료 출처가
+    필요할 때 사용한다.
+
+    KODEX200처럼 띄어쓰기가 없는 입력과
+    코덱스 200 같은 일부 한글 브랜드 표현을 지원한다.
 
     실시간 가격이나 종가, NAV 조회에는 사용하지 않는다.
     """
 
-    search_term = search_term.strip()
+    original_term = str(
+        search_term or ""
+    ).strip()
 
-    if not search_term:
+    if not original_term:
         return json.dumps(
             {
                 "success": False,
-                "message": "검색할 ETF 상품명이나 종목코드가 없습니다.",
+                "message": (
+                    "검색할 ETF 상품명이나 "
+                    "종목코드가 없습니다."
+                ),
+                "query": original_term,
                 "results": [],
             },
             ensure_ascii=False,
         )
 
-    connection = get_database_connection()
+    converted_term = apply_brand_aliases(
+        original_term
+    )
+
+    normalized_term = normalize_product_key(
+        original_term
+    )
+
+    if not normalized_term:
+        return json.dumps(
+            {
+                "success": False,
+                "message": (
+                    "검색어에서 ETF 상품명이나 "
+                    "종목코드를 확인하지 못했습니다."
+                ),
+                "query": original_term,
+                "results": [],
+            },
+            ensure_ascii=False,
+        )
+
+    product_code_term = (
+        converted_term.upper()
+    )
+
+    product_name_term = (
+        converted_term.upper()
+    )
+
+    connection = get_database_connection(
+        row_factory=dict_row
+    )
 
     try:
         cursor = connection.cursor()
 
         cursor.execute(
             """
+            WITH searchable_products AS (
+                SELECT
+                    product_code,
+                    product_name,
+                    asset_manager,
+                    asset_category,
+                    underlying_index,
+                    total_fee_percent,
+                    risk_grade,
+                    listing_date,
+                    top_holdings,
+                    holdings_date,
+                    source_name,
+                    source_url,
+                    source_date,
+                    verified_at,
+                    regexp_replace(
+                        upper(product_name),
+                        '[^A-Z0-9가-힣]',
+                        '',
+                        'g'
+                    ) AS normalized_name
+                FROM etf_products
+            )
             SELECT
                 product_code,
                 product_name,
@@ -80,33 +212,43 @@ def search_etf_product(search_term: str) -> str:
                 source_url,
                 source_date,
                 verified_at
-            FROM etf_products
+            FROM searchable_products
             WHERE
-                product_code = ?
-                OR product_name = ?
-                OR product_name LIKE ?
+                upper(product_code) = %s
+                OR upper(product_name) = %s
+                OR normalized_name = %s
+                OR normalized_name LIKE %s
             ORDER BY
                 CASE
-                    WHEN product_code = ? THEN 1
-                    WHEN product_name = ? THEN 2
-                    ELSE 3
+                    WHEN upper(product_code) = %s
+                        THEN 1
+                    WHEN upper(product_name) = %s
+                        THEN 2
+                    WHEN normalized_name = %s
+                        THEN 3
+                    ELSE 4
                 END,
-                product_name
+                product_name,
+                product_code
             LIMIT 5
             """,
             (
-                search_term,
-                search_term,
-                f"%{search_term}%",
-                search_term,
-                search_term,
+                product_code_term,
+                product_name_term,
+                normalized_term,
+                f"%{normalized_term}%",
+                product_code_term,
+                product_name_term,
+                normalized_term,
             ),
         )
 
         rows = cursor.fetchall()
 
         results = [
-            remove_empty_values(dict(row))
+            normalize_product_values(
+                dict(row)
+            )
             for row in rows
         ]
 
@@ -115,166 +257,84 @@ def search_etf_product(search_term: str) -> str:
                 {
                     "success": False,
                     "message": (
-                        f"'{search_term}'과 일치하는 ETF 상품을 "
-                        "DB에서 찾지 못했습니다."
+                        f"'{original_term}'과 일치하는 "
+                        "ETF 상품을 DB에서 찾지 못했습니다."
                     ),
+                    "query": original_term,
+                    "normalized_query": normalized_term,
                     "results": [],
                 },
                 ensure_ascii=False,
             )
 
+        response = {
+            "success": True,
+            "message": (
+                f"{len(results)}개 상품을 찾았습니다."
+            ),
+            "query": original_term,
+            "normalized_query": normalized_term,
+            "results": results,
+        }
+
+        if len(results) == 1:
+            response["resolved_product"] = {
+                "product_code": results[0][
+                    "product_code"
+                ],
+                "product_name": results[0][
+                    "product_name"
+                ],
+            }
+
         return json.dumps(
-            {
-                "success": True,
-                "message": f"{len(results)}개 상품을 찾았습니다.",
-                "results": results,
-            },
+            response,
             ensure_ascii=False,
         )
 
     finally:
         connection.close()
-
-
-def tokenize_question(text):
-    """FAQ 검색을 위해 질문을 간단한 단어로 분리합니다."""
-
-    tokens = re.findall(
-        r"[가-힣A-Za-z0-9]+",
-        text.lower(),
-    )
-
-    stop_words = {
-        "etf",
-        "무엇인가요",
-        "무엇",
-        "뭐야",
-        "뭔가요",
-        "어떻게",
-        "알려줘",
-        "알려주세요",
-        "설명해줘",
-        "설명해주세요",
-        "궁금해",
-        "질문",
-    }
-
-    return [
-        token
-        for token in tokens
-        if len(token) >= 2
-        and token not in stop_words
-    ]
 
 
 @tool
 def search_faq(user_question: str) -> str:
     """
-    ETF 기본 개념, 거래 방법, 가격정보, 비용, 분배금,
-    구성종목, 투자위험에 관한 질문을 FAQ DB에서 검색한다.
+    ETF 기본 개념, 비용, 거래 및 위험 관련 질문을
+    FAQ 벡터 유사도로 검색한다.
 
-    종가, NAV 수치나 특정 상품의 실시간 정보가 아니라
-    ETF 일반 지식과 금융 용어 설명이 필요할 때 사용한다.
+    실시간 가격이나 종가, NAV 검색에는 사용하지 않는다.
     """
 
-    user_question = user_question.strip()
+    question = str(
+        user_question or ""
+    ).strip()
 
-    if not user_question:
+    if not question or len(question) > 1000:
         return json.dumps(
             {
                 "success": False,
-                "message": "검색할 질문이 없습니다.",
+                "message": (
+                    "질문을 1~1000자로 입력해 주세요."
+                ),
                 "results": [],
             },
             ensure_ascii=False,
         )
 
-    query_tokens = tokenize_question(user_question)
-
-    connection = get_database_connection()
-
     try:
-        cursor = connection.cursor()
-
-        cursor.execute(
-            """
-            SELECT
-                faq_id,
-                category,
-                question,
-                answer,
-                keywords,
-                source_name,
-                source_url,
-                source_date,
-                verified_at
-            FROM faq
-            """
+        results = [remove_empty_values(row) for row in search_faq_vectors(question)]
+    except Exception as error:
+        log_safe_exception(
+            logger,
+            "FAQ retrieval",
+            error,
         )
-
-        rows = cursor.fetchall()
-        scored_results = []
-
-        for row in rows:
-            faq_data = dict(row)
-
-            searchable_text = " ".join(
-                [
-                    str(faq_data.get("category") or ""),
-                    str(faq_data.get("question") or ""),
-                    str(faq_data.get("keywords") or ""),
-                ]
-            ).lower()
-
-            score = 0
-
-            # 사용자 질문 전체가 FAQ 질문과 가까운 경우
-            if user_question.lower() in str(
-                faq_data.get("question") or ""
-            ).lower():
-                score += 10
-
-            # 질문에 포함된 단어가 FAQ 내용에 있는지 확인
-            for token in query_tokens:
-                if token in searchable_text:
-                    score += 2
-
-            if score > 0:
-                result = remove_empty_values(faq_data)
-                result["match_score"] = score
-                scored_results.append(result)
-
-        scored_results.sort(
-            key=lambda item: item["match_score"],
-            reverse=True,
-        )
-
-        results = scored_results[:3]
-
-        if not results:
-            return json.dumps(
-                {
-                    "success": False,
-                    "message": (
-                        "관련 FAQ를 찾지 못했습니다. "
-                        "질문을 조금 더 구체적으로 입력해 주세요."
-                    ),
-                    "results": [],
-                },
-                ensure_ascii=False,
-            )
-
-        return json.dumps(
-            {
-                "success": True,
-                "message": f"{len(results)}개의 관련 FAQ를 찾았습니다.",
-                "results": results,
-            },
-            ensure_ascii=False,
-        )
-
-    finally:
-        connection.close()
+        return json.dumps({"success": False,
+                           "message": "FAQ 벡터 검색을 사용할 수 없습니다. 임베딩 생성, API 키와 DB 설정을 확인해 주세요.",
+                           "results": []}, ensure_ascii=False)
+    return json.dumps({"success": bool(results),
+                       "message": "관련 FAQ를 찾았습니다." if results else "관련 FAQ 벡터가 없습니다. 임베딩 생성 여부를 확인하거나 질문을 구체적으로 입력해 주세요.",
+                       "results": results}, ensure_ascii=False)
 
 
 ETF_AGENT_TOOLS = [
