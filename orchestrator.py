@@ -1,7 +1,15 @@
 import json
 
+from src.services.conversation_memory import prepare_recent_history
 
-def route_question(question, client, *, include_product=False):
+
+def route_question(
+    question,
+    client,
+    *,
+    include_product=False,
+    conversation_history=None,
+):
     allowed_routes = ["etf_price", "disclosure", "news", "faq", "clarify"]
     product_instructions = ""
     name_schema = {"type": "string"}
@@ -15,6 +23,18 @@ def route_question(question, client, *, include_product=False):
             "일반 개념도 함께 묻는 경우 faq를 추가한다. "
             "상품정보와 시세 또는 공시를 함께 묻는 경우 필요한 경로를 모두 선택한다."
         )
+    recent_history = prepare_recent_history(conversation_history)
+    route_input = question
+
+    if recent_history:
+        route_input = json.dumps(
+            {
+                "recent_conversation": recent_history,
+                "current_question": question,
+            },
+            ensure_ascii=False,
+        )
+
     response = client.responses.create(
         model="gpt-5.4-mini",
         instructions=(
@@ -35,9 +55,14 @@ def route_question(question, client, *, include_product=False):
             "종가와 뉴스를 모두 요청하면 etf_price와 news를 모두 선택한다. "
             "etf_name은 질문에 나타난 표현을 그대로 사용하고, "
             "상품명이 없을 때만 none을 사용한다. "
+            "recent_conversation이 제공되면 현재 질문의 '그 ETF', '그 상품', "
+            "'아까 상품' 같은 지칭을 해석하는 데만 사용한다. "
+            "현재 질문에 새 상품명이 있으면 과거 상품보다 현재 상품을 우선한다. "
+            "현재 질문이 요청하지 않은 과거 의도나 도구를 다시 선택하지 않는다. "
+            "최근 대화에서도 상품을 특정할 수 없을 때만 clarify를 선택한다. "
             "자료 조회 결과나 수치를 만들어내지 마라."
         ) + product_instructions,
-        input=question,
+        input=route_input,
         text={
             "format": {
                 "type": "json_schema",
