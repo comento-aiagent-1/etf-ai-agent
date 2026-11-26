@@ -325,7 +325,21 @@ class ConsultationTest(unittest.TestCase):
         self.assertIn("추천하거나", result["answer"])
         self.assertIn("적합한 상품인지 판단하지 않습니다", result["answer"])
 
-    def test_recommendation_and_price_forecast_use_separate_safe_messages(self):
+    @patch("consultation.resolve_etf_product")
+    def test_recommendation_and_price_forecast_use_separate_safe_messages(
+        self,
+        resolve_product,
+    ):
+        resolve_product.return_value = {
+            "success": True,
+            "match_type": "exact",
+            "message": "ETF 상품을 확인했습니다.",
+            "product": {
+                "product_code": "069500",
+                "product_name": "KODEX 200",
+                "asset_manager": "삼성자산운용",
+            },
+        }
         history = [
             {"role": "user", "content": "KODEX 200 어때?"},
             {"role": "assistant", "content": "KODEX 200 상품정보입니다."},
@@ -348,7 +362,7 @@ class ConsultationTest(unittest.TestCase):
         client.responses.create.assert_not_called()
         self.assertIn("국내외 ETF나 종목을 골라 추천", recommendation["answer"])
         self.assertNotIn("앞서 문의하신", recommendation["answer"])
-        self.assertIn("코덱스200", forecast["answer"])
+        self.assertIn("KODEX 200", forecast["answer"])
         self.assertIn("미래 가격이 오를지 내릴지", forecast["answer"])
         self.assertNotIn("매수·매도", forecast["answer"])
 
@@ -373,6 +387,72 @@ class ConsultationTest(unittest.TestCase):
         self.assertIn("원금이나 수익을 보장할 수 없", guarantee["answer"])
         self.assertIn("투자금액", allocation["answer"])
         self.assertIn("맞춤형 포트폴리오", allocation["answer"])
+
+    def test_code_with_particle_is_reduced_to_exact_product_code(self):
+        routed = fast_route_question(
+            "069500의 최근 종가를 알려줘",
+            include_product=True,
+        )
+        self.assertEqual(routed["routes"], ["etf_price"])
+        self.assertEqual(routed["etf_name"], "069500")
+
+    def test_generic_recommendation_scope_is_not_treated_as_product_name(self):
+        routed = fast_route_question(
+            "그러면 국내 ETF 하나만 추천해줘",
+            include_product=True,
+            conversation_history=[
+                {"role": "user", "content": "KODEX 200 상품정보를 알려줘"},
+                {"role": "assistant", "content": "KODEX 200 상품정보입니다."},
+                {"role": "user", "content": "KODEX 200 지금 사도 돼?"},
+                {"role": "assistant", "content": "매수 추천은 제공하지 않습니다."},
+            ],
+        )
+        self.assertEqual(routed["routes"], ["product_recommendation"])
+        self.assertEqual(routed["etf_name"], "none")
+
+    def test_explicit_product_reference_can_reuse_recent_product_for_recommendation(self):
+        routed = fast_route_question(
+            "그 ETF 추천해?",
+            include_product=True,
+            conversation_history=[
+                {"role": "user", "content": "KODEX 200 상품정보를 알려줘"},
+                {"role": "assistant", "content": "KODEX 200 상품정보입니다."},
+            ],
+        )
+        self.assertEqual(routed["routes"], ["product_recommendation"])
+        self.assertEqual(routed["etf_name"], "KODEX 200")
+
+    def test_unresolved_explicit_reference_defers_to_context_router(self):
+        history = [
+            {"role": "user", "content": "ACE 미국S&P500 알려줘"},
+            {"role": "assistant", "content": "ACE 미국S&P500 상품정보입니다."},
+        ]
+        self.assertIsNone(
+            fast_route_question(
+                "그 ETF 원금 보장돼?",
+                include_product=True,
+                conversation_history=history,
+            )
+        )
+        self.assertIsNone(
+            fast_route_question(
+                "그건 어느 운용사 상품이야?",
+                include_product=True,
+                conversation_history=history,
+            )
+        )
+
+    @patch("consultation.resolve_etf_product")
+    def test_unknown_policy_target_is_not_displayed_as_real_product(self, resolve):
+        resolve.return_value = {
+            "success": False,
+            "error_type": "product_not_found",
+            "query": "KODEX 300",
+            "candidates": [],
+        }
+        result = consult("KODEX 300 지금 사도 돼?", "입문", Mock())
+        self.assertIn("상품 DB에 존재하지 않습니다", result["answer"])
+        self.assertNotIn("대상 상품: KODEX 300", result["answer"])
 
     def test_product_name_recall_defers_to_structured_llm_router(self):
         questions = (
