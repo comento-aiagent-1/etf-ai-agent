@@ -22,13 +22,25 @@ FAQ_TERMS = (
 )
 FOLLOW_UP_TERMS = (
     "그 etf", "그 상품", "해당 etf", "해당 상품", "아까",
-    "앞에서", "방금", "그럼", "그러면",
+    "앞에서", "방금", "그럼", "그러면", "그건", "그것", "그거는",
+)
+EXPLICIT_PRODUCT_REFERENCE_TERMS = (
+    "그 etf", "그 상품", "그 종목",
+    "해당 etf", "해당 상품", "해당 종목",
+    "아까 그", "앞에서 말한", "방금 말한",
+    "그건", "그것", "그거는",
 )
 GENERIC_PRODUCT_NAMES = {
     "etf", "상품", "종목", "국내종목", "해외종목",
     "그etf", "그상품", "그종목", "해당etf", "해당상품", "해당종목",
     "이거", "저거", "이것", "저것",
 }
+GENERIC_PRODUCT_SCOPE_TERMS = (
+    "국내", "해외", "미국", "한국", "글로벌",
+    "ETF", "상품", "종목", "펀드",
+    "하나", "한개", "한 개", "하나만", "한개만", "한 개만",
+    "아무거나", "아무거나하나", "좀",
+)
 BROAD_PRODUCT_SUFFIXES = (
     "어때", "어떤데", "괜찮아", "괜찮은가요", "괜찮나요",
 )
@@ -90,8 +102,10 @@ def _extract_product_expression(question, routes):
 
     expression = str(question)[:min(positions)].strip(" ,.?·/:-")
     expression = re.sub(r"^(?:혹시|최근|오늘|현재|실시간)\s+", "", expression)
+    # 조사와 시간 표현이 연달아 붙은 경우도 모두 제거합니다.
+    # 예: "069500의 최근 종가"에서 한 번만 제거하면 "069500의"가 남습니다.
     expression = re.sub(
-        r"(?:에\s*대한|관련|의|최근|오늘|현재|실시간|가격과|가격|정보와|정보)\s*$",
+        r"(?:(?:에\s*대한|관련|의|최근|오늘|현재|실시간|가격과|가격|정보와|정보)\s*)+$",
         "",
         expression,
     ).strip(" ,.?·/:-")
@@ -108,7 +122,7 @@ def _extract_product_before_terms(question, terms):
         return "none"
     expression = str(question)[:min(positions)].strip(" ,.?·/:-")
     expression = re.sub(
-        r"^(?:그|이|저|그거|이거|저거|아까|전에)\s+",
+        r"^(?:그러면|그렇다면|그럼|그래서|혹시|그|이|저|그거|이거|저거|아까|전에)\s+",
         "",
         expression,
     )
@@ -118,10 +132,16 @@ def _extract_product_before_terms(question, terms):
         expression,
     ).strip(" ,.?·/:-")
     normalized = re.sub(r"\s+", "", expression).casefold()
+    generic_scope = normalized
+    for term in sorted(GENERIC_PRODUCT_SCOPE_TERMS, key=len, reverse=True):
+        generic_scope = generic_scope.replace(
+            re.sub(r"\s+", "", term).casefold(),
+            "",
+        )
     if not expression or normalized in GENERIC_PRODUCT_NAMES or normalized in {
         "지금", "당장", "지금당장", "오늘", "내일", "다음주", "향후",
         "현재", "요즘", "최근",
-    }:
+    } or not generic_scope:
         return "none"
     return expression
 
@@ -186,6 +206,17 @@ def fast_route_question(question, *, include_product=False, conversation_history
         product_name = _extract_product_before_terms(question, RETURN_GUARANTEE_TERMS)
         if product_name == "none" and any(term in lowered for term in FOLLOW_UP_TERMS):
             product_name = _recent_product_name(conversation_history)
+            if (
+                product_name == "none"
+                and conversation_history
+                and any(
+                    term in lowered
+                    for term in EXPLICIT_PRODUCT_REFERENCE_TERMS
+                )
+            ):
+                # 규칙으로 최근 상품을 복원하지 못했더라도 답변 문맥에는
+                # 정식 상품명이 있을 수 있으므로 구조화 LLM 라우터에 맡깁니다.
+                return None
         return {
             "routes": ["return_guarantee"],
             "etf_name": product_name,
@@ -199,7 +230,10 @@ def fast_route_question(question, *, include_product=False, conversation_history
             question,
             PRODUCT_RECOMMENDATION_TERMS,
         )
-        if product_name == "none" and any(term in lowered for term in FOLLOW_UP_TERMS):
+        if product_name == "none" and any(
+            term in lowered
+            for term in EXPLICIT_PRODUCT_REFERENCE_TERMS
+        ):
             product_name = _recent_product_name(conversation_history)
         return {
             "routes": ["product_recommendation"],
