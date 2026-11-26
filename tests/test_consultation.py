@@ -325,7 +325,21 @@ class ConsultationTest(unittest.TestCase):
         self.assertIn("추천하거나", result["answer"])
         self.assertIn("적합한 상품인지 판단하지 않습니다", result["answer"])
 
-    def test_recommendation_and_price_forecast_use_separate_safe_messages(self):
+    @patch("consultation.resolve_etf_product")
+    def test_recommendation_and_price_forecast_use_separate_safe_messages(
+        self,
+        resolve_product,
+    ):
+        resolve_product.return_value = {
+            "success": True,
+            "match_type": "exact",
+            "message": "ETF 상품을 확인했습니다.",
+            "product": {
+                "product_code": "069500",
+                "product_name": "KODEX 200",
+                "asset_manager": "삼성자산운용",
+            },
+        }
         history = [
             {"role": "user", "content": "KODEX 200 어때?"},
             {"role": "assistant", "content": "KODEX 200 상품정보입니다."},
