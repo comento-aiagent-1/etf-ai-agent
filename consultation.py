@@ -29,6 +29,12 @@ DATA_ROUTES = {
     "news": (search_etf_news, "etf_name", "뉴스"),
     "product": (search_etf_product, "search_term", "ETF 상품"),
 }
+POLICY_TARGET_ROUTES = {
+    "investment_guidance",
+    "product_recommendation",
+    "price_forecast",
+    "return_guarantee",
+}
 TOOL_TIMING_KEYS = {
     "etf_price": "price_seconds",
     "disclosure": "disclosure_seconds",
@@ -61,7 +67,13 @@ def _report_progress(progress_callback, stage, detail):
         progress_callback(stage, detail)
 
 
-def _resolve_product_name(etf_name, *, require_confirmation=False, product_clues=None):
+def _resolve_product_name(
+    etf_name,
+    *,
+    require_confirmation=False,
+    product_clues=None,
+    reject_unknown=False,
+):
     """
     상품명을 도구에 넘기기 전에 한 번 확정합니다.
 
@@ -113,6 +125,12 @@ def _resolve_product_name(etf_name, *, require_confirmation=False, product_clues
                 "원하시는 상품을 확인한 뒤 정식 상품명을 포함해 다시 질문해 주세요."
             )
         return etf_name, message, True
+
+    if reject_unknown and resolution.get("error_type") == "product_not_found":
+        return "none", (
+            f"'{etf_name}'은(는) 상품 DB에 존재하지 않습니다. "
+            "확인되지 않은 상품을 실제 ETF로 단정하지 않습니다."
+        ), True
 
     return etf_name, None, False
 
@@ -188,7 +206,11 @@ def consult(
     product_name = routes["etf_name"]
     product_notice = None
     needs_product_confirmation = False
-    if product_name != "none" and any(route in DATA_ROUTES for route in routes["routes"]):
+    should_resolve_product = any(
+        route in DATA_ROUTES or route in POLICY_TARGET_ROUTES
+        for route in routes["routes"]
+    )
+    if product_name != "none" and should_resolve_product:
         resolution_started = time.perf_counter()
         product_name, product_notice, needs_product_confirmation = (
             _resolve_product_name(
@@ -198,6 +220,10 @@ def consult(
                     or routes.get("product_clues")
                 ),
                 product_clues=routes.get("product_clues"),
+                reject_unknown=any(
+                    route in POLICY_TARGET_ROUTES
+                    for route in routes["routes"]
+                ),
             )
         )
         timings["product_resolution_seconds"] = (
