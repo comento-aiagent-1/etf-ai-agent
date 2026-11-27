@@ -15,6 +15,8 @@ class ChatFailureTests(unittest.TestCase):
         ), patch(
             "src.services.request_logger.save_request_log",
             return_value=False,
+        ), patch(
+            "faq_agent.list_faq_questions", return_value=[],
         ):
             app = AppTest.from_file(
                 str(Path(__file__).resolve().parents[1] / "app.py"),

@@ -8,7 +8,7 @@ backups/
 __pycache__/
 *.pyc
 logs/
-data/evaluation/results/*.csv
+data/evaluation/results/
 submission/
 *.zip
 desktop.ini

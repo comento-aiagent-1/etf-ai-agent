@@ -6,6 +6,16 @@ from orchestrator import route_question
 
 
 class FaqAgentTest(unittest.TestCase):
+    def test_exact_faq_question_uses_local_answer_without_vector_api(self):
+        with patch("agent_tools.search_faq_vectors") as search:
+            response = run_faq_agent("ETF란 무엇인가요?")
+
+        search.assert_not_called()
+        self.assertTrue(response["success"])
+        self.assertEqual(response["results"][0]["faq_id"], "F001")
+        self.assertTrue(response["results"][0]["answer"])
+        self.assertTrue(response["sources"][0]["source_url"])
+
     def test_router_passes_original_question_and_faq_returns_sources(self):
         question = "ETF와 주식은 어떻게 달라?"
         row = {
@@ -51,7 +61,10 @@ class FaqAgentTest(unittest.TestCase):
                             response = run_faq_agent("질문")
                 self.assertEqual(response, {
                     "success": False,
-                    "message": "지금은 FAQ를 검색할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+                    "message": (
+                        "FAQ 검색 서비스를 사용할 수 없습니다. PostgreSQL 실행 상태와 "
+                        ".env의 OpenAI·DB 설정을 확인해 주세요."
+                    ),
                     "results": [],
                     "sources": [],
                 })

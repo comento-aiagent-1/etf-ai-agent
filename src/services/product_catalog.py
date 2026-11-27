@@ -128,6 +128,28 @@ def _numbers(text: str) -> list:
     return re.findall(r"\d+", text)
 
 
+def _is_single_digit_number_typo(query_name: str, product_name: str) -> bool:
+    """같은 상품명에서 숫자 한 자리가 추가·누락된 경우만 안전한 오타로 봅니다."""
+    query_numbers = _numbers(query_name)
+    product_numbers = _numbers(product_name)
+    if len(query_numbers) != 1 or len(product_numbers) != 1:
+        return False
+
+    query_number = query_numbers[0]
+    product_number = product_numbers[0]
+    if (
+        abs(len(query_number) - len(product_number)) != 1
+        or _edit_distance(query_number, product_number) != 1
+    ):
+        return False
+
+    # 브랜드·상품명 문자는 같고 숫자 한 자리만 추가 또는 누락된 경우로 제한합니다.
+    return (
+        re.sub(r"\d+", "", query_name)
+        == re.sub(r"\d+", "", product_name)
+    )
+
+
 def _is_in_order(short: str, long: str) -> bool:
     """short의 글자가 long 안에 순서대로 모두 들어 있는지 확인합니다."""
     remaining = iter(long)
@@ -152,7 +174,8 @@ def _fuzzy_match(original_term, normalized_query, products):
     정확히 일치하는 상품이 없을 때 편집 거리로 오타 후보를 찾습니다.
 
     - 종목코드(숫자만)는 오타로 추정하지 않습니다. 다른 실제 종목일 수 있습니다.
-    - 숫자가 다르면(예: KODEX 300) 다른 상품일 수 있어 바로 연결하지 않고 확인을 요청합니다.
+    - 숫자 한 자리의 단순 추가·누락은 명확한 후보가 하나일 때만 교정합니다.
+    - 숫자 치환(예: KODEX 300)은 다른 상품일 수 있어 교정하지 않습니다.
     """
     if normalized_query.isdigit():
         return None
@@ -171,10 +194,15 @@ def _fuzzy_match(original_term, normalized_query, products):
     if best_similarity < FUZZY_SUGGEST_MIN:
         return None
 
+    same_numbers = _numbers(normalized_query) == _numbers(best_name)
+    single_digit_number_typo = _is_single_digit_number_typo(
+        normalized_query,
+        best_name,
+    )
     if (
         best_similarity >= FUZZY_AUTO_MIN
         and best_similarity - second_similarity >= FUZZY_MARGIN
-        and _numbers(normalized_query) == _numbers(best_name)
+        and (same_numbers or single_digit_number_typo)
     ):
         product = _candidate(best_product)
         return {
