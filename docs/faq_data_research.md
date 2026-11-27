@@ -101,8 +101,9 @@
 ## 데이터 경로와 DB 반영
 
 - 앱은 읽기 전용으로 PostgreSQL `faq`를 우선 조회하며, DB 조회 오류 시 [원본 CSV](../data/source/FAQ.csv)를 표시합니다. 원본 CSV의 데이터 열은 `faq_id, category, question, answer, keywords, source_name, source_url, source_date, verified_at`입니다.
-- 기존 [build_database.py](../build_database.py)는 CSV를 검사하고 FAQ·상품을 ID 기준으로 한 트랜잭션에서 추가하거나 갱신합니다. 동일한 행은 건너뛰고 CSV에 없는 기존 DB 행은 보존합니다. 기존 데이터에 영향이 없도록 승인된 개발 DB에서 F026–F050의 충돌 여부와 상품 CSV의 변경 가능성을 먼저 확인하세요.
-- 개발 DB의 대상과 백업을 확인한 뒤 `python build_database.py`로 적재합니다. 출력의 FAQ 처리 건수와 변경 건수, DB 전체 건수를 별도로 확인합니다. CSV 밖의 기존 FAQ가 있을 수 있으므로 DB의 총 건수는 50보다 클 수 있습니다.
+- [build_database.py](../build_database.py)는 CSV를 검사하고 FAQ·상품을 ID 기준으로 한 트랜잭션에서 추가하거나 갱신합니다. 동일한 행은 건너뛰고 CSV에 없는 기존 DB 행은 보존합니다. 현재 원본 CSV와 로컬 개발 DB에는 FAQ 75개가 반영되어 있습니다.
+- 승인된 DB의 대상과 백업을 확인한 뒤 `python build_database.py`로 적재합니다. 출력의 FAQ 처리 건수와 변경 건수, DB 전체 건수를 별도로 확인하며 현재 기준 건수는 75개입니다.
 - 그다음 `python build_embeddings.py`를 실행합니다. 이 스크립트는 FAQ와 상품을 대상으로 내용 해시와 갱신 시각을 비교하며, 모델과 차원이 일치하는 변경 문서의 벡터만 교체합니다. 한 트랜잭션에서 처리하므로 오류 시 롤백되며, OpenAI 호출 동안 잠금과 비용이 발생할 수 있어 승인된 개발 DB에서 검증합니다.
-- 기존 벡터 검색은 `text-embedding-3-small` 1,536차원과 PostgreSQL pgvector의 코사인 유사도를 사용합니다. 최신 원본에 대응하는 벡터만 대상으로 `FAQ_MIN_SIMILARITY` 이상 상위 3개를 반환합니다. 설정을 바꾸지 않았으며 이 변경에는 데이터 적재 및 임베딩 실행을 포함하지 않았습니다.
-- 비밀번호 과거 노출의 교체 상태는 미확인입니다. 검색 평가 데이터셋·정확도 측정 및 코드 정리는 후속 단계입니다.
+- 현재 벡터 검색은 `text-embedding-3-large` 1,536차원과 PostgreSQL pgvector의 코사인 유사도를 사용합니다. 최신 원본에 대응하는 벡터만 대상으로 `FAQ_MIN_SIMILARITY=0.55` 이상인 결과를 최대 3개 반환합니다.
+- 자연어 변형 50개와 검색 제외 질문 10개로 모델·top-k·임계값을 평가했으며, 실제 pgvector 경로에서 hit@3 88%와 비FAQ 거부율 100%를 확인했습니다. 상세 결과는 [RAG 성능 검증 문서](rag_evaluation.md)를 참고하세요.
+- 과거 커밋에 포함된 값은 외부 운영 자격증명이 아닌 로컬 개발 기본값이므로 Git 이력을 다시 쓰지 않았습니다. 운영 자격증명은 GitHub Environment와 Azure VM 환경변수에서 별도로 관리합니다.
