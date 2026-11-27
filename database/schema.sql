@@ -70,6 +70,10 @@ ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS source_updated_at TIMESTAMP
 CREATE INDEX IF NOT EXISTS idx_chunks_small_1536_hnsw
 ON document_chunks USING hnsw ((embedding::vector(1536)) vector_cosine_ops)
 WHERE embedding_model = 'text-embedding-3-small' AND embedding_dimensions = 1536;
+
+CREATE INDEX IF NOT EXISTS idx_chunks_large_1536_hnsw
+ON document_chunks USING hnsw ((embedding::vector(1536)) vector_cosine_ops)
+WHERE embedding_model = 'text-embedding-3-large' AND embedding_dimensions = 1536;
 CREATE OR REPLACE FUNCTION set_updated_at()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN

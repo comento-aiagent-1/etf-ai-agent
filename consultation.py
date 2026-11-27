@@ -353,7 +353,18 @@ def consult(
         elif route == "return_unsupported":
             notices.append("현재 연결된 자료로는 특정 ETF의 정확한 수익률을 확인할 수 없습니다. 상품명과 조회 기간을 확인한 뒤 운용사의 공식 자료를 참고해 주세요.")
         elif route == "comparison_unsupported":
-            notices.append("여러 ETF 비교와 조건별 검색은 아직 지원하지 않습니다. 한 종목의 상품정보를 조회할 수 있습니다.")
+            if "변동성" in question:
+                notices.append(
+                    "현재 챗봇에서는 전체 ETF의 변동성을 비교한 순위를 제공할 수 없습니다. "
+                    "변동성은 일정 기간의 일별 수익률로 계산해야 하므로, 1개월·3개월·1년 같은 "
+                    "비교 기간과 각 ETF의 일별 가격 데이터가 필요합니다. 현재는 개별 ETF의 "
+                    "최근 종가와 NAV를 조회할 수 있습니다."
+                )
+            else:
+                notices.append(
+                    "현재는 전체 ETF의 기간별 데이터를 이용한 순위·조건 검색을 지원하지 않습니다. "
+                    "분석하려는 지표와 조회 기간에 맞는 시계열 데이터가 필요합니다."
+                )
         elif route == "investment_guidance":
             if product_name != "none":
                 notices.append(
