@@ -7,7 +7,7 @@ def route_question(question, client, *, include_product=False):
     product_instructions = ""
     name_schema = {"type": "string", "enum": [*market_products, "none"]}
     if include_product:
-        allowed_routes += ["product", "comparison_unsupported"]
+        allowed_routes += ["product", "comparison_unsupported", "return_unsupported"]
         name_schema = {"type": "string"}
         product_instructions = (
             "상품정보 DB는 시세·공시 지원 목록 밖의 상품도 조회할 수 있다. "
@@ -16,6 +16,10 @@ def route_question(question, client, *, include_product=False):
             "상품을 임의로 정하지 말고 정보가 부족하면 clarify를 선택한다. "
             "여러 종목 비교나 조건에 맞는 ETF 목록 검색은 comparison_unsupported를 선택한다. "
             "일반 개념도 함께 묻는 경우 faq를 추가한다. "
+            "ETF 상품이 특정되었는지와 무관하게 상품의 실제 또는 예상 수익률 수치를 요구하면 return_unsupported를 선택한다. "
+            "수익률의 의미나 투자 위험 같은 일반 교육 질문만 faq로 분류한다. "
+            "예: 'ETF 사면 매년 어떤 돈이 빠져나가요?', 'ETF 투자하면 원금을 날릴 수도 있나요?'는 faq다. "
+            "'KODEX ETF의 총보수'처럼 운용 브랜드만 있으면 상품명 또는 코드를 묻도록 clarify를 선택한다. "
             "시세·공시는 위 두 상품의 정식 이름만 etf_name에 사용한다."
         )
     response = client.responses.create(

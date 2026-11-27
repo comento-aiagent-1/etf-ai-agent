@@ -12,12 +12,11 @@ from src.services.diagnostic_logging import log_safe_exception
 logger = logging.getLogger(__name__)
 
 
-def save_request_log(*, question, elapsed_seconds, result, used_tools,
+def save_request_log(*, elapsed_seconds, result, used_tools,
                      status="success", error_type=None):
     document = {
         "_id": str(uuid4()),
         "created_at": datetime.now(timezone.utc),
-        "question": question,
         "elapsed_seconds": round(elapsed_seconds, 3),
         "result": result,
         "status": status,

@@ -7,12 +7,14 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
+from psycopg import Error as PostgresError
 
 load_dotenv(
     dotenv_path=Path(__file__).resolve().parent / ".env",
 )
 
 from consultation import LEVELS, consult
+from faq_agent import list_faq_questions
 from src.services.diagnostic_logging import log_safe_exception
 from src.services.request_logger import save_request_log
 
@@ -44,13 +46,13 @@ TOOL_LABELS = {
 KNOWLEDGE_LEVELS = list(LEVELS)
 CATEGORY_LABELS = {
     "기본개념": "ETF 기초 개념",
-    "가격정보": "ETF 상품 분석 및 비교",
+    "가격정보": "ETF 상품 이해",
     "거래": "ETF 거래 및 비용",
     "비용": "ETF 거래 및 비용",
-    "분배금": "ETF 거래 및 비용",
-    "상품정보": "ETF 투자 시작하기",
-    "위험": "투자 위험 및 고급 개념",
-    "공시": "ETF 상품 분석 및 비교",
+    "분배금": "ETF 상품 이해",
+    "상품정보": "ETF 상품 이해",
+    "위험": "ETF 수익 및 위험",
+    "공시": "ETF 상품 이해",
     "투자유의": "ETF 투자 시작하기",
 }
 FAQ_SOURCE_PATH = (
@@ -61,13 +63,16 @@ FAQ_SOURCE_PATH = (
 )
 
 
+@st.cache_data(ttl=60, max_entries=1, show_spinner=False)
 def load_faq_questions():
-    with FAQ_SOURCE_PATH.open(
-        "r",
-        encoding="utf-8-sig",
-        newline="",
-    ) as faq_file:
-        return list(csv.DictReader(faq_file))
+    try:
+        return list_faq_questions(), "db"
+    except (PostgresError, OSError):
+        try:
+            with FAQ_SOURCE_PATH.open(encoding="utf-8-sig", newline="") as faq_file:
+                return list(csv.DictReader(faq_file)), "csv"
+        except (OSError, UnicodeError, csv.Error):
+            return [], "unavailable"
 
 
 def render_sources(sources, message_index):
@@ -215,12 +220,10 @@ with st.sidebar:
     knowledge_level = st.segmented_control(
         "ETF 배경지식 수준",
         KNOWLEDGE_LEVELS,
-        default="입문",
         key="knowledge_level",
     )
     st.caption(
-        "질문에 '입문자예요'처럼 수준을 적으면 "
-        "선택한 수준보다 우선해 반영합니다."
+        "수준을 선택하면 답변에 적용합니다. 선택하지 않으면 질문에 적은 수준이나 초급으로 설명합니다."
     )
 
     if st.button(
@@ -264,11 +267,22 @@ with st.sidebar:
 
     st.divider()
     st.subheader("자주 묻는 질문")
-    faq_search = st.text_input("FAQ 검색", placeholder="예: 분배금, 환율 위험").strip().casefold()
+    faq_search = st.text_input(
+        "FAQ 목록 검색", placeholder="예: 분배금, 환율 위험", key="faq_search",
+    ).strip().casefold()
+    faq_rows, faq_origin = load_faq_questions()
+    if faq_origin == "csv":
+        st.caption("FAQ DB 연결을 확인할 수 없어 배포에 포함된 원본 CSV의 목록을 표시합니다.")
+    elif faq_origin == "unavailable":
+        st.warning("FAQ 목록을 불러오지 못했습니다. 채팅창에 직접 질문할 수 있습니다.")
     grouped_faqs = {}
-    for faq in load_faq_questions():
-        category = CATEGORY_LABELS.get(faq["category"], faq["category"])
-        searchable = " ".join((faq["question"], category, faq["keywords"])).casefold()
+    for faq in faq_rows:
+        faq_id, question_text = faq.get("faq_id"), faq.get("question")
+        if not faq_id or not question_text:
+            continue
+        raw_category = faq.get("category") or "기타 FAQ"
+        category = CATEGORY_LABELS.get(raw_category, raw_category)
+        searchable = " ".join((question_text, category, faq.get("keywords") or "")).casefold()
         if all(term in searchable for term in faq_search.split()):
             grouped_faqs.setdefault(category, []).append(faq)
     for category, rows in grouped_faqs.items():
@@ -277,14 +291,14 @@ with st.sidebar:
                 if st.button(faq["question"], key=f"faq_{faq['faq_id']}", width="stretch"):
                     selected_question = faq["question"]
                     selected_faq = True
-    if not grouped_faqs:
+    if not grouped_faqs and faq_origin != "unavailable":
         st.info("일치하는 FAQ가 없습니다. 채팅창에 직접 질문해 보세요.")
 
     latest = st.session_state.messages[-1] if st.session_state.messages else {}
     if questions and latest.get("role") == "assistant":
         easy, detailed = st.columns(2)
         if easy.button("더 쉽게", width="stretch"):
-            requested_level = "입문"
+            requested_level = "초급"
         if detailed.button("더 자세히", width="stretch"):
             requested_level = "고급"
         if requested_level:
@@ -389,6 +403,13 @@ for message_index, message in enumerate(st.session_state.messages):
             "used_tools",
             [],
         )
+
+        if message["role"] == "assistant" and "search_faq" in used_tools:
+            st.segmented_control(
+                "FAQ 답변 평가",
+                ["도움이 됐어요", "부족해요"],
+                key=f"faq_feedback_{message_index}",
+            )
 
         if used_tools:
             displayed_tools = (
@@ -550,7 +571,6 @@ if question:
 
     # 응답시간 기록
     if not save_request_log(
-        question=question,
         elapsed_seconds=elapsed_seconds,
         result=result,
         used_tools=used_tools,

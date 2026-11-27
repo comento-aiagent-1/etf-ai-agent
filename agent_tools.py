@@ -329,9 +329,15 @@ def search_faq(user_question: str) -> str:
             "FAQ retrieval",
             error,
         )
-        return json.dumps({"success": False,
-                           "message": "FAQ 벡터 검색을 사용할 수 없습니다. 임베딩 생성, API 키와 DB 설정을 확인해 주세요.",
-                           "results": []}, ensure_ascii=False)
+        return json.dumps({
+            "success": False,
+            "error_code": "FAQ_SEARCH_UNAVAILABLE",
+            "message": (
+                "FAQ 검색 서비스를 사용할 수 없습니다. PostgreSQL 실행 상태와 "
+                ".env의 OpenAI·DB 설정을 확인해 주세요."
+            ),
+            "results": [],
+        }, ensure_ascii=False)
     return json.dumps({"success": bool(results),
                        "message": "관련 FAQ를 찾았습니다." if results else "관련 FAQ 벡터가 없습니다. 임베딩 생성 여부를 확인하거나 질문을 구체적으로 입력해 주세요.",
                        "results": results}, ensure_ascii=False)
