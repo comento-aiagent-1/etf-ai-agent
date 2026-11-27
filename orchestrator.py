@@ -347,7 +347,7 @@ def route_question(
     product_instructions = ""
     name_schema = {"type": "string"}
     if include_product:
-        allowed_routes += ["product", "comparison_unsupported"]
+        allowed_routes += ["product", "comparison_unsupported", "return_unsupported"]
         product_instructions = (
             "특정 ETF 한 종목의 총보수, 추종지수, 운용사 또는 구성 정보를 묻는 경우 product를 선택하고, "
             "질문에 있는 상품명 또는 종목코드를 etf_name에 넣는다. "
@@ -356,7 +356,12 @@ def route_question(
             "'KODEX 200 어때?'처럼 상품명은 명확하지만 질문 범위가 넓으면 "
             "clarify 대신 product를 선택한다. "
             "일반 개념도 함께 묻는 경우 faq를 추가한다. "
-            "상품정보와 시세 또는 공시를 함께 묻는 경우 필요한 경로를 모두 선택한다."
+            "상품정보와 시세 또는 공시를 함께 묻는 경우 필요한 경로를 모두 선택한다. "
+            "ETF 상품이 특정되었는지와 무관하게 상품의 실제 또는 예상 수익률 수치를 요구하면 return_unsupported를 선택한다. "
+            "수익률의 의미나 투자 위험 같은 일반 교육 질문만 faq로 분류한다. "
+            "예: 'ETF 사면 매년 어떤 돈이 빠져나가요?', 'ETF 투자하면 원금을 날릴 수도 있나요?'는 faq다. "
+            "'KODEX ETF의 총보수'처럼 운용 브랜드만 있으면 상품명 또는 코드를 묻도록 clarify를 선택한다. "
+            "시세·공시는 위 두 상품의 정식 이름만 etf_name에 사용한다."
         )
     recent_history = prepare_recent_history(conversation_history)
     route_input = question
