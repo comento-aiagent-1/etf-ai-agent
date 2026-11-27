@@ -48,6 +48,13 @@ class TypoCorrectionTest(unittest.TestCase):
         self.assertEqual(resolved_code("TIGER 미국SNP500"), "360750")
         self.assertEqual(resolved_code("에이스 금현물"), "411060")
 
+    def test_single_extra_digit_is_corrected_when_candidate_is_clear(self):
+        result = match_products("코덱스 2000", PRODUCTS)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["product"]["product_code"], "069500")
+        self.assertEqual(result["match_type"], "typo_corrected")
+        self.assertIn("KODEX 200", result["message"])
+
 
 class ConfirmationTest(unittest.TestCase):
     def assert_asks(self, query, expected_codes):
@@ -161,6 +168,39 @@ class ConsultationProductResolutionTest(unittest.TestCase):
         self.assertEqual(
             result["tool_inputs"],
             [{"tool": "search_etf_news", "args": {"etf_name": "KODEX 200"}}],
+        )
+
+    def test_extra_digit_typo_is_corrected_before_price_lookup(self):
+        price = Mock()
+        price.name = "get_etf_price"
+        price.invoke.return_value = json.dumps({
+            "success": True,
+            "data": {
+                "product_name": "KODEX 200",
+                "product_code": "069500",
+                "data_date": "2026-11-27",
+                "close_price": 73770,
+            },
+        })
+        client = Mock()
+        client.responses.create.return_value = Mock(
+            output_text="KODEX 200의 기준일 종가는 73,770원입니다."
+        )
+
+        with patch(
+            "consultation.resolve_etf_product",
+            side_effect=lambda name: match_products(name, PRODUCTS),
+        ), patch.dict(
+            "consultation.DATA_ROUTES",
+            {"etf_price": (price, "etf_name", "시세")},
+        ):
+            result = consult("코덱스 2000 종가 알려줘", "입문", client)
+
+        price.invoke.assert_called_once_with({"etf_name": "KODEX 200"})
+        self.assertTrue(
+            result["answer"].startswith(
+                "'코덱스 2000'을(를) 'KODEX 200'(으)로 해석했습니다."
+            )
         )
 
     def test_ambiguous_product_asks_instead_of_guessing(self):

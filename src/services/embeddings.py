@@ -9,7 +9,7 @@ from openai import OpenAI
 
 from src.db.postgres import BASE_DIR
 
-MODEL = "text-embedding-3-small"
+MODEL = "text-embedding-3-large"
 DIMENSIONS = 1536
 
 
@@ -51,7 +51,7 @@ def embed_texts(texts):
 
 def minimum_similarity():
     load_dotenv(BASE_DIR / ".env")
-    threshold = float(os.getenv("FAQ_MIN_SIMILARITY", "0.3"))
+    threshold = float(os.getenv("FAQ_MIN_SIMILARITY", "0.55"))
     if not 0 <= threshold <= 1:
         raise ValueError("FAQ_MIN_SIMILARITY must be between 0 and 1")
     return threshold

@@ -56,6 +56,14 @@ PRODUCT_RECOMMENDATION_TERMS = (
     "어떤 종목", "어떤 etf", "제일 좋은", "가장 좋은", "1등 etf",
     "유망한 etf", "유망 종목", "베스트 etf",
 )
+ANALYTICAL_COMPARISON_METRICS = (
+    "변동성", "수익률", "거래량", "거래대금", "등락률",
+    "괴리율", "추적오차",
+)
+ANALYTICAL_RANKING_TERMS = (
+    "가장", "제일", "순위", "1등", "상위", "하위",
+    "높은", "낮은", "큰", "작은", "심한",
+)
 PRICE_FORECAST_TERMS = (
     "오를까", "올라갈까", "상승할까", "내릴까", "떨어질까",
     "하락할까", "가격 전망", "주가 전망", "목표가", "예측해",
@@ -75,6 +83,10 @@ PRODUCT_NAME_RECALL_TERMS = (
     "상품 이름", "상품이름", "상품명", "정식 이름", "정식이름",
     "이름이 뭐", "이름 뭐", "이름 그 뭐", "뭐였지", "뭐였더라",
     "뭐더라", "정확한 이름",
+)
+PRODUCT_EXISTENCE_TERMS = (
+    "상품 맞아", "실제 상품", "상장된 상품", "등록된 상품",
+    "존재해", "등록돼", "등록되어",
 )
 
 
@@ -127,7 +139,7 @@ def _extract_product_before_terms(question, terms):
         expression,
     )
     expression = re.sub(
-        r"(?:은|는|이|가|을|를|지금|당장|오늘|내일|다음주|향후|현재|요즘|최근)\s*$",
+        r"(?:이라는|라는|은|는|이|가|을|를|지금|당장|오늘|내일|다음주|향후|현재|요즘|최근)\s*$",
         "",
         expression,
     ).strip(" ,.?·/:-")
@@ -148,7 +160,7 @@ def _extract_product_before_terms(question, terms):
 
 def _recent_product_name(conversation_history):
     for message in reversed(prepare_recent_history(conversation_history)):
-        if message.get("role") != "user":
+        if message.get("role") not in {"user", "assistant"}:
             continue
         content = message.get("content", "")
         routes = _find_routes(content)
@@ -191,6 +203,56 @@ def fast_route_question(question, *, include_product=False, conversation_history
                     "router_mode": "rule",
                 }
         return None
+
+    # 사용자가 입력한 이름이 실제 등록 상품인지 묻는 질문은 LLM이 비슷한
+    # 상품을 임의로 완성하지 않도록 DB 상품 확인 경로로 바로 보냅니다.
+    if include_product and any(term in lowered for term in PRODUCT_EXISTENCE_TERMS):
+        product_name = _extract_product_before_terms(
+            question,
+            PRODUCT_EXISTENCE_TERMS,
+        )
+        if product_name != "none":
+            return {
+                "routes": ["product"],
+                "etf_name": product_name,
+                "router_mode": "rule",
+            }
+
+    # '그 상품 종가', '그 ETF 뉴스'처럼 의도와 지시어가 모두 명확하면
+    # LLM에 다시 추측시키지 않고 최근 대화의 정식 상품을 이어받습니다.
+    explicit_data_routes = _find_routes(question)
+    if (
+        explicit_data_routes
+        and any(term in lowered for term in EXPLICIT_PRODUCT_REFERENCE_TERMS)
+    ):
+        current_product = _extract_product_expression(
+            question,
+            explicit_data_routes,
+        )
+        if "말고" in current_product:
+            current_product = current_product.rsplit("말고", 1)[-1].strip()
+        elif any(
+            term in current_product.casefold()
+            for term in EXPLICIT_PRODUCT_REFERENCE_TERMS
+        ):
+            current_product = "none"
+        normalized_current = re.sub(
+            r"\s+",
+            "",
+            current_product,
+        ).casefold()
+        if normalized_current in GENERIC_PRODUCT_NAMES:
+            current_product = "none"
+
+        target_product = current_product
+        if target_product == "none":
+            target_product = _recent_product_name(conversation_history)
+        if target_product != "none":
+            return {
+                "routes": explicit_data_routes,
+                "etf_name": target_product,
+                "router_mode": "rule",
+            }
 
     if (
         any(term in lowered for term in PERSONALIZED_ALLOCATION_TERMS)
@@ -238,6 +300,20 @@ def fast_route_question(question, *, include_product=False, conversation_history
         return {
             "routes": ["product_recommendation"],
             "etf_name": product_name,
+            "router_mode": "rule",
+        }
+
+    # 여러 ETF의 지표 순위·최댓값을 묻는 질문은 상품 추천과 구분합니다.
+    # 현재 서비스에는 전체 상품의 기간별 시계열 비교 도구가 없으므로
+    # 지원 범위와 필요한 자료를 정확히 안내하는 경로로 보냅니다.
+    if (
+        include_product
+        and any(term in lowered for term in ANALYTICAL_COMPARISON_METRICS)
+        and any(term in lowered for term in ANALYTICAL_RANKING_TERMS)
+    ):
+        return {
+            "routes": ["comparison_unsupported"],
+            "etf_name": "none",
             "router_mode": "rule",
         }
 
@@ -352,7 +428,8 @@ def route_question(
             "특정 ETF 한 종목의 총보수, 추종지수, 운용사 또는 구성 정보를 묻는 경우 product를 선택하고, "
             "질문에 있는 상품명 또는 종목코드를 etf_name에 넣는다. "
             "상품을 임의로 정하지 말고 정보가 부족하면 clarify를 선택한다. "
-            "여러 종목 비교나 조건에 맞는 ETF 목록 검색은 comparison_unsupported를 선택한다. "
+            "여러 종목 비교, 조건 검색, 변동성·수익률·거래량 등의 순위 분석은 "
+            "추천 요청이 아니므로 comparison_unsupported를 선택한다. "
             "'KODEX 200 어때?'처럼 상품명은 명확하지만 질문 범위가 넓으면 "
             "clarify 대신 product를 선택한다. "
             "일반 개념도 함께 묻는 경우 faq를 추가한다. "

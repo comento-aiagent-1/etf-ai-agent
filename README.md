@@ -546,7 +546,7 @@ DB 우선 표시 경로에서 신규 항목을 사용하려면 개발 DB에 데�
 - 환율 및 상품 위험
 - 공시 확인 방법
 
-FAQ 검색은 OpenAI `text-embedding-3-small`과 PostgreSQL pgvector를 사용합니다.
+FAQ 검색은 평가 결과에 따라 OpenAI `text-embedding-3-large`(1536차원)와 PostgreSQL pgvector를 사용합니다.
 
 ### 로그 데이터
 
@@ -602,7 +602,7 @@ MongoDB
 | LLM | OpenAI API | 질문 해석, 도구 선택, 답변 생성 |
 | 상품·FAQ DB | PostgreSQL | 정형 데이터 관리 |
 | 벡터 검색 | pgvector | FAQ 의미 기반 검색 |
-| 임베딩 | text-embedding-3-small | 검색용 벡터 생성 |
+| 임베딩 | text-embedding-3-large (1536차원) | FAQ 검색 평가에서 hit@3 96%로 선정 |
 | 로그 DB | MongoDB | 요청·응답 시간·처리 상태 기록 |
 | 로컬 DB 실행 | Docker Compose | 공통 DB 환경 구성 |
 | 시세 | 금융위원회 증권상품시세정보 API | 기준일 종가·NAV 조회 |

@@ -510,6 +510,76 @@ class ConsultationTest(unittest.TestCase):
         self.assertIn("투자금액", allocation["answer"])
         self.assertIn("맞춤형 포트폴리오", allocation["answer"])
 
+    def test_analytical_rankings_are_not_treated_as_recommendations(self):
+        questions = (
+            "최근 변동성이 가장 심했던 ETF 종목이 뭐야",
+            "최근 거래량이 제일 높은 ETF가 뭐야",
+            "수익률 상위 ETF 순위를 알려줘",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                routed = fast_route_question(question, include_product=True)
+                self.assertEqual(routed["routes"], ["comparison_unsupported"])
+                self.assertEqual(routed["etf_name"], "none")
+
+        recommendation = fast_route_question(
+            "수익률 높은 1등 ETF 골라줘",
+            include_product=True,
+        )
+        self.assertEqual(recommendation["routes"], ["product_recommendation"])
+
+    def test_explicit_data_follow_up_reuses_recent_product_without_llm(self):
+        history = [
+            {"role": "user", "content": "ACE 200이 어떤 상품이야?"},
+            {"role": "assistant", "content": "ACE 200 상품정보입니다."},
+        ]
+        routed = fast_route_question(
+            "그 상품 종가도 보여줘",
+            include_product=True,
+            conversation_history=history,
+        )
+        self.assertEqual(
+            routed,
+            {
+                "routes": ["etf_price"],
+                "etf_name": "ACE 200",
+                "router_mode": "rule",
+            },
+        )
+
+        overridden = fast_route_question(
+            "그 상품 말고 ACE 200 뉴스 알려줘",
+            include_product=True,
+            conversation_history=[
+                {"role": "user", "content": "KODEX 200 상품정보 알려줘"},
+                {"role": "assistant", "content": "KODEX 200 상품정보입니다."},
+            ],
+        )
+        self.assertEqual(overridden["routes"], ["news"])
+        self.assertEqual(overridden["etf_name"], "ACE 200")
+
+    def test_product_existence_question_uses_database_route(self):
+        routed = fast_route_question(
+            "KODEX 300이라는 상품 맞아?",
+            include_product=True,
+        )
+        self.assertEqual(routed["routes"], ["product"])
+        self.assertEqual(routed["etf_name"], "KODEX 300")
+
+    def test_volatility_comparison_explains_missing_analysis_data(self):
+        client = Mock()
+        result = consult(
+            "최근 변동성이 가장 심했던 ETF 종목이 뭐야",
+            "입문",
+            client,
+        )
+        client.responses.create.assert_not_called()
+        self.assertIn("변동성을 비교한 순위", result["answer"])
+        self.assertIn("일별 가격 데이터", result["answer"])
+        self.assertIn("최근 종가와 NAV", result["answer"])
+        self.assertNotIn("상품 추천", result["answer"])
+        self.assertNotIn("매수·매도", result["answer"])
+
     def test_code_with_particle_is_reduced_to_exact_product_code(self):
         routed = fast_route_question(
             "069500의 최근 종가를 알려줘",
@@ -544,24 +614,34 @@ class ConsultationTest(unittest.TestCase):
         self.assertEqual(routed["routes"], ["product_recommendation"])
         self.assertEqual(routed["etf_name"], "KODEX 200")
 
-    def test_unresolved_explicit_reference_defers_to_context_router(self):
+    def test_explicit_reference_uses_product_from_recent_answer(self):
         history = [
             {"role": "user", "content": "ACE 미국S&P500 알려줘"},
             {"role": "assistant", "content": "ACE 미국S&P500 상품정보입니다."},
         ]
-        self.assertIsNone(
+        self.assertEqual(
             fast_route_question(
                 "그 ETF 원금 보장돼?",
                 include_product=True,
                 conversation_history=history,
-            )
+            ),
+            {
+                "routes": ["return_guarantee"],
+                "etf_name": "ACE 미국S&P500",
+                "router_mode": "rule",
+            },
         )
-        self.assertIsNone(
+        self.assertEqual(
             fast_route_question(
                 "그건 어느 운용사 상품이야?",
                 include_product=True,
                 conversation_history=history,
-            )
+            ),
+            {
+                "routes": ["product"],
+                "etf_name": "ACE 미국S&P500",
+                "router_mode": "rule",
+            },
         )
 
     @patch("consultation.resolve_etf_product")
@@ -600,7 +680,7 @@ class ConsultationTest(unittest.TestCase):
             routed,
             {
                 "routes": ["product"],
-                "etf_name": "069500",
+                "etf_name": "KODEX 200",
                 "router_mode": "rule",
             },
         )
