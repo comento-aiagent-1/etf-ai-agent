@@ -1,6 +1,201 @@
 # ETF AI 상담센터
 
+## Docker로 앱 실행
+
+처음 실행할 때 `.env.example`을 `.env`로 복사하고 API 키를 입력합니다.
+기존 `.env`가 있으면 그대로 사용합니다. Docker Desktop이 실행 중이어야 합니다.
+
+```bash
+docker compose up -d --build --wait
+docker compose ps
+docker compose logs --tail=50 app
+```
+
+접속: http://localhost:8501
+
+- 앱은 `infra/Dockerfile`로 빌드하며 PostgreSQL·MongoDB가 준비되면 시작합니다.
+- 컨테이너의 DB 호스트와 포트는 Compose가 서비스 이름과 내부 포트로 설정합니다.
+- `.env`와 Streamlit secrets는 이미지에 포함되지 않습니다. 환경변수는 실행할 때 주입합니다.
+- `data/source`는 이미지에 포함되며, `data/cache`와 `logs`는 호스트 폴더에 보존됩니다.
+- DB는 기존 named volume에 보존됩니다. 데이터를 유지하려면 `docker compose down -v`를 사용하지 마세요.
+- 소스를 변경한 뒤에는 위 명령으로 다시 빌드합니다. 코드 폴더는 마운트하지 않습니다.
+- 8501은 로컬 인터페이스에만 공개됩니다. Azure에서는 호스트 Nginx가 이 포트로 프록시합니다.
+- CORS·XSRF 보호는 활성화되어 있습니다. HTTPS 프록시에는 WebSocket 헤더 전달 설정이 추가로 필요합니다.
+- 직접 의존성은 로컬 환경의 버전으로 고정했습니다. 전이 의존성까지 고정한 lock 파일은 아닙니다.
+
+새 DB에 최초 데이터를 넣을 때만 다음 순서로 실행합니다. 임베딩 생성은 OpenAI API를 호출합니다.
+
+```bash
+docker compose exec app python build_database.py
+docker compose exec app python build_embeddings.py
+```
+
+앱 중지: `docker compose stop app`. 전체 서비스 중지: `docker compose stop`.
+
 > 사용자 질문을 분석하고 ETF 상품 DB·FAQ·시세·공시·뉴스를 조회하여 근거와 출처가 포함된 답변을 제공하는 AI 에이전트 챗봇
+
+## Azure 운영 Compose와 데이터 보존
+
+### GitHub Actions에서 이미지 게시
+
+`.github/workflows/deploy.yml`은 `dev`·`main` push 시 이미지를 빌드하고,
+그 이미지 안에서 외부 네트워크 없이 단위 테스트를 실행한 뒤 GHCR에 게시합니다.
+PR에서는 빌드·테스트만 실행합니다. 수동 실행도 가능하지만 이미지는 `dev`·`main`에서만 게시합니다.
+`dev`에서 `main`으로 PR을 병합하면 `main` push 이벤트로 이미지 게시 후 Azure SSH 배포를 실행합니다.
+`dev` push는 이미지 게시까지만 수행하며, PR과 수동 실행에서는 운영 배포하지 않습니다.
+배포 조건은 `main` push로 고정되어 있습니다. 직접 push도 배포되므로 `main` 브랜치를 PR 병합만 허용하도록 보호하세요.
+
+- 별도 API 키나 PAT를 GitHub Secrets에 등록할 필요가 없습니다. 게시에는 자동 제공되는 `GITHUB_TOKEN`과 `packages: write` 권한을 사용합니다.
+- 조직 정책에서 Actions와 패키지 생성을 허용해야 합니다. 기존 패키지에 게시 권한 오류가 나면 패키지 설정의 Manage Actions access에서 이 저장소에 쓰기 권한을 부여합니다.
+- 이미지 경로: `ghcr.io/comento-aiagent-1/etf-ai-agent:<40자리 커밋 SHA>`.
+- 성공한 Actions 실행의 Summary에서 `APP_IMAGE=...` 값을 복사해 VM `.env`에 넣습니다.
+- `latest` 태그는 게시하지 않습니다. 운영 반영할 커밋의 SHA를 직접 선택합니다.
+- private GHCR 이미지라면 VM에서 `read:packages` 권한의 PAT(classic)로 먼저 로그인해야 합니다. 조직 SSO가 있다면 토큰 승인도 필요합니다.
+
+```bash
+# Azure Bash: GitHub 사용자명과 PAT를 대화형으로 입력 (토큰은 화면에 표시하지 않음)
+read -r -p 'GitHub username: ' GHCR_USER
+read -r -s -p 'GHCR read token: ' GHCR_READ_TOKEN
+printf '\n'
+printf '%s' "$GHCR_READ_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+unset GHCR_READ_TOKEN
+```
+
+로그인은 배포 명령과 같은 Linux 사용자로 수행합니다. 실제 API 키는 VM의 `.env`에만 보관합니다.
+
+### Azure SSH 자동 배포 최초 설정
+
+자동 배포는 기존 `/opt/etf-ai-agent/compose.prod.yaml`과 `.env`를 사용합니다.
+VM에서 첫 수동 배포와 해당 Linux 사용자의 GHCR 로그인을 완료해야 합니다.
+VM에 Bash, Python 3, flock, Docker Compose가 필요합니다. Ubuntu 기본 구성과 앞의 설치 절차를 기준으로 합니다.
+워크플로는 DB·Nginx·스키마를 갱신하지 않고 앱만 교체합니다. 운영 Compose 변경은 별도 검토 후 VM에 반영하세요.
+
+**1. GitHub Environment:** 저장소 Settings → Environments에서 `production`을 생성하고,
+Deployment branches and tags에서 Selected branches and tags를 선택하고 Branch `main`만 허용합니다. 기존 `dev` 허용 규칙은 제거하세요.
+
+**2. Azure OIDC:** Azure Portal → Microsoft Entra ID → App registrations에서 배포용 앱을 등록합니다.
+Certificates & secrets → Federated credentials → Add credential → GitHub Actions를 선택합니다.
+Organization=`comento-aiagent-1`, Repository=`etf-ai-agent`, Entity type=`Environment`, Environment=`production`으로 설정합니다.
+Subject는 `repo:comento-aiagent-1/etf-ai-agent:environment:production`, Audience는 `api://AzureADTokenExchange`입니다.
+Client secret은 만들지 않습니다. 앱 등록·역할 할당이 구독 정책상 제한되면 Azure 관리자에게 해당 설정을 요청해야 합니다.
+VM에 연결된 NSG → Access control (IAM)에서 이 앱의 서비스 주체에 **Network Contributor** 역할을
+**해당 NSG 리소스 범위로만** 부여합니다. 전체 구독 범위 권한은 필요하지 않습니다.
+
+**3. GitHub Environment `production`의 Secrets:**
+
+| 이름 | 값 |
+| --- | --- |
+| `VM_HOST` | `4.230.18.14` |
+| `VM_USER` | `azureuser` |
+| `SSH_PRIVATE_KEY` | 해당 VM에 등록된 SSH 개인 키 전체 (BEGIN/END 줄 포함) |
+| `SSH_KNOWN_HOSTS` | 신뢰하는 경로로 확인한 서버 호스트 공개 키 한 줄 |
+| `AZURE_CLIENT_ID` | 앱 등록의 Application (client) ID |
+| `AZURE_TENANT_ID` | Directory (tenant) ID |
+| `AZURE_SUBSCRIPTION_ID` | Azure for Students 구독 ID |
+
+이미 신뢰하고 접속한 VM의 Ubuntu 터미널에서 다음으로 `SSH_KNOWN_HOSTS` 값을 만듭니다.
+이 파일은 서버 **공개 키**이며 클라이언트 개인 키와 다릅니다.
+
+```bash
+printf '4.230.18.14 '
+cut -d ' ' -f 1,2 /etc/ssh/ssh_host_ed25519_key.pub
+```
+
+**4. Environment Variables:** `AZURE_NSG_NAME`과 `AZURE_NSG_RESOURCE_GROUP`에 VM에 연결된
+NSG 이름과 그 NSG의 리소스 그룹 이름을 등록합니다. 기존 `DEPLOY_BRANCH` 변수가 있다면 삭제해도 됩니다. 워크플로에서 사용하지 않습니다.
+
+GitHub 호스팅 runner IP는 실행마다 달라집니다. 워크플로는 OIDC로 Azure에 인증하고 runner의 IPv4 `/32`만
+허용하는 임시 SSH 규칙을 생성한 뒤 배포 후 제거합니다. 내 IP의 기존 SSH 규칙은 유지합니다.
+서브넷에 별도 NSG가 있거나 UFW에서 SSH를 내 IP로만 제한했다면 추가 네트워크 구성이 필요합니다.
+임시 규칙은 빈 우선순위 3000~3999를 사용하므로 더 높은 우선순위의 차단 규칙이 없어야 합니다.
+runner 강제 종료나 Azure 장애로 정리가 실패하면 NSG의 `gha-ssh-<run_id>-<attempt>` 규칙을 수동으로 제거하세요.
+
+**5. 검증:** `dev` PR 병합 시 `image`만 실행되고 `deploy`는 skipped인지 확인합니다.
+이후 `dev` → `main` PR을 병합하면 Actions의 `image`와 `deploy`가 모두 성공하는지 확인합니다.
+배포는 이미지를 내려받고 앱만 재생성하여 healthcheck를 기다립니다. 성공 후 `.env`의 `APP_IMAGE`만 갱신하며,
+실패하면 이전 로컬 이미지로 롤백을 시도하고 작업을 실패 처리합니다. DB 볼륨과 API 키는 유지합니다.
+healthcheck는 프로세스 준비 상태 검사이며 실제 RAG 질의 성공을 보장하지 않으므로 HTTPS 화면에서도 질문을 확인하세요.
+컨테이너 교체 시 기존 채팅 세션이 끊길 수 있습니다. 동시에 두 배포가 실행되지 않도록 직렬화되어 있습니다.
+
+`compose.prod.yaml`은 독립된 운영 설정입니다. 로컬 `compose.yaml`과 합쳐 실행하지 않습니다.
+아래 명령은 **Azure Ubuntu의 Bash**에서 실행합니다. GHCR에 이미지가 게시된 이후에 사용합니다.
+
+배포 폴더 `/opt/etf-ai-agent`에는 다음 파일이 필요합니다.
+
+```text
+compose.prod.yaml
+.env                   # .env.prod.example을 복사하고 실제 값을 입력
+database/schema.sql
+```
+
+`.env`의 `APP_IMAGE`에 GHCR 이미지의 커밋 SHA 태그를 지정하고 API 키와 새 DB 비밀번호를 입력합니다.
+비밀번호가 빈 값이면 Compose가 실행을 거부합니다. `$`, `#`가 포함된 값은 작은따옴표로 감쌉니다.
+운영 자격증명은 Git 또는 이미지에 넣지 않습니다. 개인 GHCR 패키지는 VM에서 먼저 `docker login ghcr.io`가 필요합니다.
+
+```bash
+cd /opt/etf-ai-agent
+chmod 600 .env
+docker compose -f compose.prod.yaml config --quiet
+docker compose -f compose.prod.yaml pull
+docker compose -f compose.prod.yaml up -d --no-build --wait
+docker compose -f compose.prod.yaml ps
+curl -fsS http://127.0.0.1:8501/_stcore/health
+```
+
+- 프로젝트 이름은 `etf-ai-agent-prod`로 고정되어 폴더 이름 변경에도 볼륨 이름이 유지됩니다. 운영에서 `-p`나 `COMPOSE_PROJECT_NAME`으로 바꾸지 마세요.
+- PostgreSQL·벡터는 `etf-ai-agent-prod_postgres_data`, MongoDB는 `etf-ai-agent-prod_mongo_data`와 `etf-ai-agent-prod_mongo_config`에 저장됩니다.
+- 캐시·파일 로그는 `etf-ai-agent-prod_app_cache`, `etf-ai-agent-prod_app_logs`에 저장됩니다. 새 볼륨은 이미지 디렉터리의 UID 10001 소유권을 이어받습니다.
+- DB 포트는 호스트에 공개하지 않습니다. 앱만 `127.0.0.1:8501`에 연결하며 이후 호스트 Nginx에서 접근합니다.
+- 컨테이너 출력 로그는 서비스별 파일 10MB × 3개로 순환합니다. 앱 로그 볼륨의 파일은 별도 보관 정책이 필요합니다.
+- 기존 볼륨이 있으면 `.env` 수정만으로 DB 이름·사용자·비밀번호가 변경되지 않습니다. DB 내부 변경과 앱 설정 변경을 함께 진행해야 합니다.
+- `database/schema.sql`은 빈 PostgreSQL 볼륨의 최초 초기화 때만 실행됩니다. 이후 스키마 변경은 백업 후 별도 마이그레이션으로 적용합니다.
+- 새 운영 DB에는 상품·FAQ·벡터가 없습니다. 최초 1회 데이터 적재·임베딩 생성 또는 기존 DB 백업 복원이 필요합니다.
+
+### 재배포와 보존 확인
+
+`.env`의 `APP_IMAGE`를 새 SHA로 변경한 뒤 앱만 갱신합니다.
+
+```bash
+docker compose -f compose.prod.yaml pull app
+docker compose -f compose.prod.yaml up -d --no-deps --no-build --wait app
+```
+
+전후 상품·FAQ·벡터 개수와 MongoDB 요청 로그를 비교하고 실제 질문으로 확인합니다.
+문제가 있으면 `APP_IMAGE`를 이전 SHA로 되돌리고 같은 명령을 실행합니다. DB 스키마 변경은 이미지 롤백과 별개입니다.
+`stop`, `down`과 컨테이너 재생성은 named volume을 유지합니다. **`down -v`나 해당 볼륨 삭제는 데이터를 지웁니다.**
+볼륨은 백업이 아니며 VM·디스크 삭제에 대비해 백업을 VM 외부에도 보관해야 합니다.
+
+### DB 백업과 복원
+
+아래는 쓰기 작업을 잠시 멈춘 상태에서 두 DB를 백업하는 예시입니다. 수동 적재·임베딩 작업도 중지합니다.
+PostgreSQL은 앱 DB 전체, MongoDB는 인증정보를 포함한 전체 DB를 백업하므로 파일 접근을 제한합니다.
+
+```bash
+cd /opt/etf-ai-agent
+set -e
+umask 077
+backup_dir="backups/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$backup_dir"
+docker compose -f compose.prod.yaml stop app
+trap 'docker compose -f compose.prod.yaml start app' EXIT
+docker compose -f compose.prod.yaml exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$backup_dir/postgres.dump"
+docker compose -f compose.prod.yaml exec -T mongodb sh -c 'mongodump --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --archive --gzip' > "$backup_dir/mongodb.archive.gz"
+docker compose -f compose.prod.yaml start app
+trap - EXIT
+```
+
+백업 파일을 별도 Azure Blob Storage 등으로 복사하고 정기적으로 복원 검증합니다.
+복원은 **새 격리 환경의 빈 DB**에서 먼저 수행합니다. 기존 데이터에 덮어쓰지 마세요.
+PostgreSQL 초기화가 만든 스키마와 충돌하지 않도록 새 대상 DB를 비운 뒤 다음을 실행합니다.
+이때 DB 이름·비밀번호 등은 복원 대상 환경의 `.env`를 사용합니다.
+
+```bash
+# 빈 복원 대상 DB에서만 실행 (Bash)
+docker compose -f compose.prod.yaml exec -T postgres sh -c 'pg_restore --exit-on-error --no-owner --no-privileges -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < "$backup_dir/postgres.dump"
+docker compose -f compose.prod.yaml exec -T mongodb sh -c 'mongorestore --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --archive --gzip --nsExclude="admin.*" --nsExclude="config.*" --nsExclude="local.*"' < "$backup_dir/mongodb.archive.gz"
+```
+
+MongoDB 복원은 대상 환경의 관리자 계정을 유지합니다. 앱 DB 이름을 변경했다면 MongoDB 복원 시 `--nsFrom`·`--nsTo`로 이름을 매핑해야 합니다.
 
 코멘토 AI 에이전트 개발 부트캠프 팀 프로젝트입니다.
 
@@ -260,6 +455,32 @@ app.py
 FAQ 작업 브랜치에서 Mock 기반 상담·회귀 테스트와 Streamlit AppTest를 실행했습니다.
 실제 OpenAI·PostgreSQL 연동은 별도의 라이브 테스트가 필요합니다.
 
+### 5.5 상품명 오타·유사 표현 검색
+
+정확한 상품명을 입력하지 않아도 올바른 ETF를 찾도록 `src/services/product_catalog.py`의 상품명 확정 단계를 개선했습니다. 시세·공시·뉴스·상품정보 조회 전에 `consultation.py`에서 상품명을 한 번 확정합니다.
+
+1. 기존 정규화 우선: 종목코드, 정식 상품명, 한글 브랜드(코덱스→KODEX), 띄어쓰기·대소문자 차이
+2. 못 찾으면 오타 후보 검색: 편집 거리 유사도(글자 삽입·삭제·바꾸기·순서 뒤바뀜)와, 상품명에 글자가 순서대로 들어 있는지 확인
+3. 결과 처리
+   - 후보가 명확하면 정식 상품으로 연결하고 "'COXEX200'을(를) 'KODEX 200'(으)로 해석했습니다"라고 안내
+   - 비슷한 후보가 여러 개이거나 숫자가 다르면(예: `KODEX 300`) 추측하지 않고 "혹시 이 상품을 찾으셨나요?"라고 확인
+   - DB에 없는 상품(예: `KODEX 레버리지`, `KODEX 200선물인버스2X`)은 비슷한 상품으로 연결하지 않음
+   - 종목코드는 오타로 추정하지 않음(`069501`은 다른 실제 종목일 수 있음)
+
+**평가** (`py eval_product_search.py --vector`, 질문 34개: 정확한 이름·띄어쓰기·종목코드·한글 브랜드·영문/한글 오타·부분 표현·모호한 표현·DB에 없는 상품)
+
+| 방식 | 정답률 | 오인식(다른 상품으로 연결) |
+| --- | --- | --- |
+| 기존 규칙 | 21/34 (62%) | 1 |
+| **규칙 + 오타 대응 (적용)** | **34/34 (100%)** | **0** |
+| BM25 (글자 2-gram) | 18/34 (53%) | 16 |
+| 벡터 (OpenAI 임베딩) | 16/34 (47%) | 18 |
+| 하이브리드 (BM25+벡터) | 17/34 (50%) | 17 |
+
+- BM25·벡터·하이브리드는 항상 가장 비슷한 상품 하나를 고르기 때문에, DB에 없는 상품이나 모호한 표현도 엉뚱한 상품으로 연결했습니다. `COXEX200` 같은 철자 오류는 벡터 검색에서도 잘 잡히지 않아, 상품명 확정에는 편집 거리 기반 오타 대응이 더 적합했습니다. 하이브리드 검색은 문장 단위 검색(FAQ 등)에 더 맞습니다.
+- 기준값은 이 평가 질문으로 정했으므로 100%는 낙관적인 수치입니다. 팀 평가 질문셋이 만들어지면 그 질문으로 다시 측정해야 합니다.
+- 같은 기준은 `tests/test_product_typo.py`로 자동 테스트합니다.
+
 ---
 
 ## 6. 멘토 피드백 반영
@@ -273,11 +494,11 @@ FAQ 작업 브랜치에서 Mock 기반 상담·회귀 테스트와 Streamlit App
 | 시세 결과 캐싱 | 반영 | 한국 날짜 기준 프로세스 메모리 캐시 |
 | 한국 시간 기준 날짜 처리 | 일부 반영 | 시세 조회·공시 검색·결과 검증에 적용 |
 | 질문별 운영 기록 | 구현 | MongoDB에 응답 시간·도구·처리 상태 등 저장 |
-| 로그의 질문 원문 제거 | FAQ 작업 브랜치 반영 | 신규 상담 로그에 질문 원문 대신 응답 시간·도구·처리 상태를 저장 |
-| 최근 대화 문맥 유지 | 미반영 | 후속 질문의 상품 대상을 유지하는 메모리 필요 |
-| 별도 라우터 도입 | 예정 | 필요한 전문 기능만 호출하도록 개선 |
-| 신규 FAQ 전문 에이전트 | 통합 대기 | 테스트 및 dev 병합 필요 |
-| 평가 데이터셋 기반 성능 비교 | 예정 | 의도 분류·검색·응답 품질 평가 필요 |
+| 로그의 질문 원문 제거 | 반영 | 원문 대신 질문 길이·분야·요약 저장, 개인정보 마스킹, 90일 자동 삭제 |
+| 최근 대화 문맥 유지 | 반영 | 최근 대화 내용을 후속 질문의 상품 대상 해석에 사용 |
+| 별도 라우터 도입 | 반영 | 규칙 기반 선분류 후 필요한 전문 기능만 호출 |
+| 신규 FAQ 전문 에이전트 | 반영 | 출처 기반 FAQ 검색, FAQ 탐색 화면과 CSV 대체 목록 구현 |
+| 평가 데이터셋 기반 성능 비교 | 일부 반영 | 평가 질문셋과 검색·라우팅 평가 스크립트 추가 |
 | 의존성 버전 고정 | 보완 필요 | 재현 가능한 실행 환경 정리 필요 |
 
 ---
@@ -337,19 +558,37 @@ MongoDB
    └─ request_logs
 ```
 
-현재 주요 기록 항목:
+개인정보 보호를 위해 **사용자 질문과 답변 원문은 저장하지 않습니다.**
 
-- 기록 시각
-- 사용자 질문 원문
-- 응답 시간
-- 처리 결과
-- 사용 도구 목록
-- 시세 API 사용 여부
-- 오류 유형
+| 항목 | 예시 | 설명 |
+| --- | --- | --- |
+| `_id` | `3f2a…` | 요청 ID |
+| `session_id` | `a91c…` | 가명 대화 ID. 대화 화면마다 무작위로 만들며 실제 사용자와 연결되지 않음 |
+| `created_at` | `2026-11-24T02:10:00Z` | 기록 시각 (UTC, 한국 시간은 +9시간) |
+| `question_length` | `19` | 질문 글자 수 |
+| `categories` | `["시세", "뉴스"]` | 질문 분야 (사용한 도구로 판단) |
+| `question_summary` | `시세 · KODEX 200 / 뉴스 · KODEX 200` | 분야와 조회한 상품명으로 만든 요약 |
+| `used_tools` | `["get_etf_price", "search_etf_news"]` | 사용한 도구 |
+| `elapsed_seconds` | `9.085` | 응답 시간(초) |
+| `status`, `result`, `error_type` | `success` | 처리 상태와 오류 유형 |
 
-기록 시각은 UTC로 저장합니다. 한국 시간은 UTC에 9시간을 더해 확인할 수 있습니다.
+- **요약은 LLM으로 만들지 않습니다.** 에이전트가 어떤 도구를 어떤 상품명으로 호출했는지로 만들기 때문에 사용자 문장이 들어가지 않습니다. FAQ 질문은 도구 입력에 사용자 문장이 들어가므로 요약에 `FAQ`라고만 남깁니다.
+- **마스킹:** 요약에 남는 텍스트에서 이메일과, 하이픈·공백으로 끊겨 있어도 숫자가 7개 이상 이어지는 값(전화번호·주민등록번호·계좌번호)을 `***`로 가립니다. 종목코드(6자리)와 상품명은 그대로 둡니다.
+- **보관 기간:** `created_at` 기준으로 90일이 지난 로그는 MongoDB가 자동 삭제합니다. `.env`의 `LOG_RETENTION_DAYS`로 바꿀 수 있습니다.
+- **기존 로그 정리:** 이 변경 전에 쌓인 로그에는 질문 원문이 남아 있습니다. 아래 명령은 기본적으로 개수만 확인하며, `--apply`를 붙이면 원문 항목만 지웁니다. 지운 원문은 되돌릴 수 없으므로 팀 확인 후 실행합니다.
 
-현재 로그에는 질문 원문이 포함되므로, 공개 서비스 전에는 질문 길이·사용 도구·시간·상태 중심으로 저장 범위를 줄여야 합니다.
+  ```powershell
+  py cleanup_log_questions.py
+  py cleanup_log_questions.py --apply
+  ```
+
+- **DB 접근 권한:** 로컬에서는 관리자 계정으로 접속합니다. 배포 환경에서는 로그 DB만 읽고 쓸 수 있는 전용 계정을 만들고 `.env`의 `MONGO_APP_USERNAME`, `MONGO_APP_PASSWORD`, `MONGO_AUTH_SOURCE`에 넣으면 앱이 관리자 계정 대신 이 계정을 사용합니다.
+
+  ```javascript
+  // mongosh에서 관리자 계정으로 실행 (비밀번호는 강한 값으로 교체)
+  use etf_agent
+  db.createUser({ user: "etf_log_writer", pwd: "<강한_비밀번호>", roles: [{ role: "readWrite", db: "etf_agent" }] })
+  ```
 
 ---
 

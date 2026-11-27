@@ -3,6 +3,7 @@
 기사를 가져오는 부분은 news_api.py에 있습니다.
 """
 import json
+import os
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -16,6 +17,31 @@ from news_api import (
     find_etf_news,
     register_news_link,
 )
+from src.services.product_catalog import resolve_etf_product
+from src.services.ttl_cache import TTLCache
+
+
+NEWS_CACHE_SECONDS = int(os.getenv("NEWS_CACHE_SECONDS", "600"))
+_NEWS_CACHE = TTLCache(maxsize=128)
+
+
+def _resolution_error(resolution):
+    return json.dumps(
+        {
+            "success": False,
+            "error_type": resolution.get(
+                "error_type",
+                "product_resolution_failed",
+            ),
+            "message": resolution.get(
+                "message",
+                "ETF 상품을 확인하지 못했습니다.",
+            ),
+            "query": resolution.get("query"),
+            "candidates": resolution.get("candidates", []),
+        },
+        ensure_ascii=False,
+    )
 
 
 def valid_iso_date(value):
@@ -81,19 +107,32 @@ def search_etf_news(etf_name: str) -> str:
     기사 본문은 포함하지 않는다.
     """
 
-    etf_name = clean_etf_name(etf_name)
+    search_term = clean_etf_name(etf_name)
 
-    if not etf_name:
+    if not search_term:
         return json.dumps(
             {
                 "success": False,
+                "error_type": "invalid_query",
                 "message": "뉴스를 검색할 ETF 상품명이 없습니다.",
             },
             ensure_ascii=False,
         )
 
+    resolution = resolve_etf_product(search_term)
+
+    if not resolution.get("success"):
+        return _resolution_error(resolution)
+
+    product = resolution["product"]
+    canonical_name = product["product_name"]
+
     try:
-        result = find_etf_news(etf_name)
+        result, cache_hit = _NEWS_CACHE.get_or_set(
+            ("news", canonical_name),
+            lambda: find_etf_news(canonical_name),
+            ttl_seconds=NEWS_CACHE_SECONDS,
+        )
 
     except NewsFetchError:
         return json.dumps(
@@ -109,7 +148,7 @@ def search_etf_news(etf_name: str) -> str:
 
     valid, reason = validate_news_result(
         result,
-        etf_name,
+        canonical_name,
     )
 
     if not valid:
@@ -126,7 +165,7 @@ def search_etf_news(etf_name: str) -> str:
             {
                 "success": False,
                 "message": (
-                    f"최근 30일 동안 '{etf_name}' 관련 뉴스를 "
+                    f"최근 30일 동안 '{canonical_name}' 관련 뉴스를 "
                     "찾지 못했습니다. 상품명을 정확히 입력했는지 "
                     "확인해 주세요."
                 ),
@@ -141,12 +180,15 @@ def search_etf_news(etf_name: str) -> str:
     return json.dumps(
         {
             "success": True,
+            "requested_term": search_term,
+            "resolved_product": product,
             "etf_name": result["etf_name"],
             "search_period": {
                 "start_date": result["start_date"],
                 "end_date": result["end_date"],
             },
             "checked_at": result["checked_at"],
+            "cache_hit": cache_hit,
             "articles": result["articles"],
             "notice": (
                 "기사 제목·언론사·날짜만 확인한 자료입니다. "

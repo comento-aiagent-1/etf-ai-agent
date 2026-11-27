@@ -10,6 +10,7 @@ from agent_tools import ETF_AGENT_TOOLS
 from api_tools import EXTERNAL_API_TOOLS
 from news_api import resolve_news_links
 from news_tools import NEWS_TOOLS
+from src.services.conversation_memory import prepare_recent_history
 
 load_dotenv(
     dotenv_path=Path(__file__).resolve().parent / ".env",
@@ -157,7 +158,11 @@ KNOWLEDGE_LEVEL_GUIDANCE = {
 }
 
 
-def run_etf_agent(question, knowledge_level=None):
+def run_etf_agent(
+    question,
+    knowledge_level=None,
+    conversation_history=None,
+):
     """
     사용자 질문을 LangChain 에이전트에 전달하고
     최종 답변과 사용한 도구 목록을 반환합니다.
@@ -199,6 +204,9 @@ def run_etf_agent(question, knowledge_level=None):
                 ),
             }
         )
+    messages.extend(
+        prepare_recent_history(conversation_history)
+    )
     messages.append(
         {
             "role": "user",
@@ -217,6 +225,8 @@ def run_etf_agent(question, knowledge_level=None):
         }
 
     used_tools = []
+    # 로그 요약용: 에이전트가 어떤 도구를 어떤 입력으로 불렀는지 모읍니다.
+    tool_inputs = []
 
     for message in messages:
         message_type = getattr(message, "type", "")
@@ -227,10 +237,19 @@ def run_etf_agent(question, knowledge_level=None):
             if tool_name and tool_name not in used_tools:
                 used_tools.append(tool_name)
 
+        for call in getattr(message, "tool_calls", None) or []:
+            tool_inputs.append(
+                {
+                    "tool": call.get("name"),
+                    "args": call.get("args") or {},
+                }
+            )
+
     final_message = messages[-1]
     answer = resolve_news_links(extract_answer(final_message))
 
     return {
         "answer": answer,
         "used_tools": used_tools,
+        "tool_inputs": tool_inputs,
     }
