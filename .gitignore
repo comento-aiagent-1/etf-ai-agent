@@ -10,6 +10,8 @@ __pycache__/
 logs/
 data/evaluation/results/
 submission/
+data/*.db
+data/source/*.backup_*.csv
 *.zip
 desktop.ini
 # Byte-compiled / optimized / DLL files
