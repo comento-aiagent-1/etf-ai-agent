@@ -279,7 +279,7 @@ class ConsultationTest(unittest.TestCase):
     def test_news_route_reaches_news_tool_and_keeps_article_sources(self):
         client = Mock()
         client.responses.create.return_value = Mock(
-            output_text="최근 ETF 뉴스 제목을 확인했습니다."
+            output_text="[기사 원문](NEWS_LINK_deadbeef)"
         )
         news = Mock()
         news.name = "search_etf_news"
@@ -295,14 +295,20 @@ class ConsultationTest(unittest.TestCase):
             }],
         })
 
-        with patch.dict(
-            "consultation.DATA_ROUTES",
-            {"news": (news, "etf_name", "뉴스")},
+        with patch("news_api.secrets.token_hex", return_value="deadbeef"), patch.dict(
+            "consultation.DATA_ROUTES", {"news": (news, "etf_name", "뉴스")}
         ):
             result = consult("KODEX 200 최근 뉴스 알려줘", "입문", client)
 
         news.invoke.assert_called_once_with({"etf_name": "KODEX 200"})
         self.assertEqual(result["used_tools"], ["search_etf_news"])
+        generation_input = client.responses.create.call_args.kwargs["input"]
+        self.assertIn("NEWS_LINK_deadbeef", generation_input)
+        self.assertNotIn("https://news.google.com/articles/test", generation_input)
+        self.assertIn(
+            "[기사 원문](https://news.google.com/articles/test)",
+            result["answer"],
+        )
         self.assertIn(
             {
                 "source_name": "KODEX 200 관련 기사",
