@@ -431,6 +431,80 @@ class ConsultationTest(unittest.TestCase):
         self.assertIn("매수·매도", result["answer"])
         self.assertIn("상품 추천은 제공하지 않습니다", result["answer"])
 
+    def test_general_etf_suitability_does_not_treat_story_as_product_name(self):
+        question = "내가 예전에 주식으로 돈 1000만원을 잃었는데, ETF는 괜찮아?"
+
+        routed = fast_route_question(question, include_product=True)
+        result = consult(question, "입문", Mock())
+
+        self.assertEqual(routed["routes"], ["investment_guidance"])
+        self.assertEqual(routed["etf_name"], "none")
+        self.assertEqual(result["used_tools"], [])
+        self.assertNotIn("상품 DB에 존재하지 않습니다", result["answer"])
+        self.assertIn("ETF라고 해서 자동으로 안전한 것은 아닙니다", result["answer"])
+        self.assertIn("분산", result["answer"])
+        self.assertIn("원금 손실", result["answer"])
+        self.assertIn("상품 추천은 제공하지", result["answer"])
+
+    def test_short_lookup_follow_up_reuses_offered_fields_and_asks_for_product(self):
+        history = [
+            {
+                "role": "user",
+                "content": "ETF는 원금 보장이 되나",
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "어떤 ETF나 종목도 원금이나 수익을 보장할 수 없습니다. "
+                    "원하시면 확인된 위험등급·총보수·기초지수 정보를 조회해 드릴 수 있습니다."
+                ),
+            },
+        ]
+
+        routed = fast_route_question(
+            "조회해봐",
+            include_product=True,
+            conversation_history=history,
+        )
+        result = consult(
+            "조회해봐",
+            "입문",
+            Mock(),
+            conversation_history=history,
+        )
+
+        self.assertEqual(routed["routes"], ["clarify"])
+        self.assertEqual(routed["etf_name"], "none")
+        self.assertEqual(routed["router_mode"], "rule_context")
+        self.assertEqual(
+            routed["clarify_fields"],
+            ["위험등급", "총보수", "기초지수"],
+        )
+        self.assertIn("앞서 말씀드린 위험등급·총보수·기초지수", result["answer"])
+        self.assertIn("상품명이나 종목코드", result["answer"])
+
+    def test_short_lookup_follow_up_uses_recent_product_when_available(self):
+        history = [
+            {"role": "user", "content": "KODEX 200 상품정보 알려줘"},
+            {
+                "role": "assistant",
+                "content": (
+                    "KODEX 200 상품정보입니다. 원하시면 위험등급·총보수·기초지수를 "
+                    "조회해 드릴 수 있습니다."
+                ),
+            },
+        ]
+
+        routed = fast_route_question(
+            "그럼 조회해봐",
+            include_product=True,
+            conversation_history=history,
+        )
+
+        self.assertEqual(routed["routes"], ["product"])
+        self.assertEqual(routed["etf_name"], "KODEX 200")
+        self.assertEqual(routed["router_mode"], "rule_context")
+
     def test_generated_recommendation_is_removed_before_display(self):
         client = Mock()
         client.responses.create.return_value = Mock(

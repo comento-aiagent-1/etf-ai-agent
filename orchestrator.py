@@ -49,7 +49,12 @@ INVESTMENT_ADVICE_TERMS = (
     "매수", "매도", "팔까", "팔아도", "투자해도",
     "들어가도", "보유할까", "계속 보유", "지금 사", "언제 사",
     "언제 팔", "손절", "익절", "물타기", "추가 매수", "추매",
-    "갈아탈까", "진입할까",
+    "갈아탈까", "진입할까", "괜찮아", "괜찮을까", "괜찮나요",
+)
+FOLLOW_UP_ACTION_TERMS = (
+    "조회해봐", "조회해 봐", "조회해줘", "조회해 줘",
+    "확인해봐", "확인해 봐", "확인해줘", "확인해 줘",
+    "알아봐", "알아 봐", "그거 보여줘", "그거 보여 줘", "그거 해줘",
 )
 PRODUCT_RECOMMENDATION_TERMS = (
     "추천", "골라줘", "골라 줘", "뭐가 좋아", "무엇이 좋아",
@@ -143,6 +148,20 @@ def _extract_product_before_terms(question, terms):
         "",
         expression,
     ).strip(" ,.?·/:-")
+    # 개인 경험이나 배경 설명 뒤에 실제 대상을 덧붙이는 구어체에서는
+    # 마지막 절만 상품 후보로 사용합니다.
+    clauses = [
+        part.strip()
+        for part in re.split(r"[,，;]\s*", expression)
+        if part.strip()
+    ]
+    if len(clauses) > 1:
+        expression = clauses[-1]
+        expression = re.sub(
+            r"(?:이라는|라는|은|는|이|가|을|를)\s*$",
+            "",
+            expression,
+        ).strip(" ,.?·/:-")
     normalized = re.sub(r"\s+", "", expression).casefold()
     generic_scope = normalized
     for term in sorted(GENERIC_PRODUCT_SCOPE_TERMS, key=len, reverse=True):
@@ -158,6 +177,52 @@ def _extract_product_before_terms(question, terms):
     return expression
 
 
+def _offered_follow_up_routes(conversation_history):
+    """직전 답변이 제안한 조회 항목을 데이터 경로로 변환합니다."""
+    history = prepare_recent_history(conversation_history)
+    last_assistant = next(
+        (
+            message.get("content", "")
+            for message in reversed(history)
+            if message.get("role") == "assistant"
+        ),
+        "",
+    )
+    if not last_assistant:
+        return [], []
+
+    lowered = last_assistant.casefold()
+    routes = []
+    fields = []
+    route_fields = {
+        "product": ("상품정보", "위험등급", "총보수", "기초지수", "운용사", "구성종목"),
+        "etf_price": ("시세", "종가", "nav"),
+        "disclosure": ("공시",),
+        "news": ("뉴스", "기사"),
+    }
+    for route, terms in route_fields.items():
+        matched = [term for term in terms if term.casefold() in lowered]
+        if matched:
+            routes.append(route)
+            fields.extend(matched)
+    return routes, list(dict.fromkeys(fields))
+
+
+def _usable_recent_product(candidate):
+    """대화 문장 전체를 상품명으로 오인하지 않도록 짧은 후보만 허용합니다."""
+    text = str(candidate or "").strip()
+    normalized = re.sub(r"\s+", "", text).casefold()
+    if not text or normalized in GENERIC_PRODUCT_NAMES:
+        return False
+    if len(text) > 60 or "\n" in text:
+        return False
+    sentence_markers = (
+        "원하시면", "제공하지", "조회해 드릴", "확인 가능한",
+        "어떤 etf", "투자 결정", "손실 가능성",
+    )
+    return not any(marker in text.casefold() for marker in sentence_markers)
+
+
 def _recent_product_name(conversation_history):
     for message in reversed(prepare_recent_history(conversation_history)):
         if message.get("role") not in {"user", "assistant"}:
@@ -165,7 +230,7 @@ def _recent_product_name(conversation_history):
         content = message.get("content", "")
         routes = _find_routes(content)
         product_name = _extract_product_expression(content, routes) if routes else "none"
-        if product_name != "none":
+        if product_name != "none" and _usable_recent_product(product_name):
             return product_name
         broad_match = re.match(
             rf"^(.+?)\s*(?:은|는|이|가)?\s*(?:{'|'.join(BROAD_PRODUCT_SUFFIXES)})[?.!\s]*$",
@@ -174,7 +239,19 @@ def _recent_product_name(conversation_history):
         )
         if broad_match:
             product_name = broad_match.group(1).strip()
-            if re.sub(r"\s+", "", product_name).casefold() not in GENERIC_PRODUCT_NAMES:
+            clauses = [
+                part.strip()
+                for part in re.split(r"[,，;]\s*", product_name)
+                if part.strip()
+            ]
+            if len(clauses) > 1:
+                product_name = clauses[-1]
+                product_name = re.sub(
+                    r"(?:이라는|라는|은|는|이|가|을|를)\s*$",
+                    "",
+                    product_name,
+                ).strip()
+            if _usable_recent_product(product_name):
                 return product_name
     return "none"
 
@@ -187,6 +264,27 @@ def fast_route_question(question, *, include_product=False, conversation_history
     lowered = str(question or "").strip().casefold()
     if not lowered:
         return None
+
+    # 직전 답변이 제안한 조회를 승인하는 짧은 후속 발화는
+    # 제안된 항목과 최근 상품을 함께 복원합니다.
+    if any(term in lowered for term in FOLLOW_UP_ACTION_TERMS):
+        offered_routes, offered_fields = _offered_follow_up_routes(
+            conversation_history
+        )
+        if offered_routes:
+            recent_product = _recent_product_name(conversation_history)
+            if recent_product != "none":
+                return {
+                    "routes": offered_routes,
+                    "etf_name": recent_product,
+                    "router_mode": "rule_context",
+                }
+            return {
+                "routes": ["clarify"],
+                "etf_name": "none",
+                "clarify_fields": offered_fields,
+                "router_mode": "rule_context",
+            }
 
     # 상품명 회상형 문장은 운용사·브랜드·숫자·테마가 섞일 수 있으므로
     # 일부 표현만 규칙으로 잘라내지 않고 LLM 구조화 라우터에 맡깁니다.
