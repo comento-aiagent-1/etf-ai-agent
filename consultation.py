@@ -8,7 +8,7 @@ import time
 from agent_tools import search_etf_product
 from api_tools import get_etf_price, search_etf_disclosure
 from faq_agent import faq_sources, find_local_faq, run_faq_agent
-from news_api import resolve_news_links
+from news_api import resolve_news_links, tokenize_news_links
 from news_tools import search_etf_news
 from orchestrator import fast_route_question, route_question
 from src.services.conversation_memory import prepare_recent_history
@@ -226,6 +226,7 @@ def consult(
     notices = []
     used_tools = []
     cache_hits = {}
+    news_link_map = {}
     # 로그 요약용: 어떤 도구를 어떤 상품명으로 불렀는지 (질문 원문은 넣지 않음)
     tool_inputs = []
 
@@ -304,6 +305,12 @@ def consult(
                         payload.get("cache_hit")
                     )
                 if payload.get("success") is True:
+                    if route == "news":
+                        tokenized_articles, request_links = tokenize_news_links(
+                            payload.get("articles", [])
+                        )
+                        payload["articles"] = tokenized_articles
+                        news_link_map.update(request_links)
                     records = payload["results"] if route == "product" else [payload.get("data", payload)]
                     tool_sources = []
                     for record in records:
@@ -322,7 +329,9 @@ def consult(
                         tool_sources.extend(
                             {
                                 "source_name": item["title"],
-                                "source_url": resolve_news_links(item["url"]),
+                                "source_url": resolve_news_links(
+                                    item["url"], news_link_map
+                                ),
                                 "data_date": item.get("published_at"),
                             }
                             for item in payload.get("articles", [])
@@ -465,7 +474,10 @@ def consult(
                 store=False,
             )
             answer = _remove_investment_recommendation(
-                resolve_news_links((response.output_text or "").strip())
+                resolve_news_links(
+                    (response.output_text or "").strip(),
+                    news_link_map,
+                )
             )
         except Exception as error:
             log_safe_exception(logger, "ETF answer generation", error)

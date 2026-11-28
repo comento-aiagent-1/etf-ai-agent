@@ -5,7 +5,7 @@ API 키가 필요 없습니다. 기사 본문은 가져오지 않습니다.
 import re
 import secrets
 import xml.etree.ElementTree as ET
-from collections import OrderedDict
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
@@ -23,32 +23,37 @@ MAX_NAME_LENGTH = 50
 MAX_ARTICLES = 5
 
 # 구글 뉴스 링크는 300자가 넘어서 LLM이 그대로 옮겨 쓰다 망가뜨립니다.
-# 그래서 LLM에는 짧은 표시(NEWS_LINK_xxxxxxxx)만 주고,
-# 답변이 완성된 뒤 resolve_news_links()로 진짜 링크로 바꿉니다.
+# 링크 매핑은 서버 전역에 저장하지 않고 상담 요청 안에서만 사용합니다.
 LINK_TOKEN_PATTERN = re.compile(r"NEWS_LINK_[0-9a-f]{8}")
 MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]\n]+)\]\(\s*(NEWS_LINK_[0-9a-f]{8})\s*\)")
-MAX_SAVED_LINKS = 500
-_saved_links = OrderedDict()
 
 
-def register_news_link(url):
-    """진짜 링크를 저장하고 LLM에 줄 짧은 표시를 돌려줍니다."""
-    token = f"NEWS_LINK_{secrets.token_hex(4)}"
-    _saved_links[token] = url
-    while len(_saved_links) > MAX_SAVED_LINKS:
-        _saved_links.popitem(last=False)
-    return token
+def tokenize_news_links(articles):
+    """기사 목록을 복사해 URL을 요청 범위 토큰으로 바꿉니다."""
+    tokenized = deepcopy(articles)
+    link_map = {}
+    for article in tokenized:
+        url = article.get("url")
+        if not url:
+            continue
+        token = f"NEWS_LINK_{secrets.token_hex(4)}"
+        while token in link_map:
+            token = f"NEWS_LINK_{secrets.token_hex(4)}"
+        link_map[token] = url
+        article["url"] = token
+    return tokenized, link_map
 
 
-def resolve_news_links(text):
-    """답변 속 짧은 표시를 진짜 링크로 바꿉니다. 모르는 표시는 지웁니다."""
+def resolve_news_links(text, link_map):
+    """요청 범위 매핑으로 링크 표시를 복원하고 모르는 표시는 지웁니다."""
+    link_map = link_map or {}
 
     def replace_markdown(match):
-        url = _saved_links.get(match.group(2))
+        url = link_map.get(match.group(2))
         return f"[{match.group(1)}]({url})" if url else match.group(1)
 
     text = MARKDOWN_LINK_PATTERN.sub(replace_markdown, text)
-    return LINK_TOKEN_PATTERN.sub(lambda m: _saved_links.get(m.group(0), ""), text)
+    return LINK_TOKEN_PATTERN.sub(lambda m: link_map.get(m.group(0), ""), text)
 SEARCH_DAYS = (7, 30)  # 7일 안에 기사가 없으면 30일까지 넓혀서 찾습니다.
 
 

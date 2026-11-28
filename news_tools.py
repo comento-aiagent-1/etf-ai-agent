@@ -15,7 +15,6 @@ from news_api import (
     NewsFetchError,
     clean_etf_name,
     find_etf_news,
-    register_news_link,
 )
 from src.services.product_catalog import resolve_etf_product
 from src.services.ttl_cache import TTLCache
@@ -172,10 +171,6 @@ def search_etf_news(etf_name: str) -> str:
             },
             ensure_ascii=False,
         )
-
-    # 검증이 끝난 진짜 링크는 저장해 두고, LLM에는 짧은 표시만 줍니다.
-    for article in result["articles"]:
-        article["url"] = register_news_link(article["url"])
 
     return json.dumps(
         {
