@@ -736,16 +736,21 @@ class ConsultationTest(unittest.TestCase):
         self.assertIn("상품 DB에 존재하지 않습니다", result["answer"])
         self.assertNotIn("대상 상품: KODEX 300", result["answer"])
 
-    def test_product_name_recall_defers_to_structured_llm_router(self):
+    def test_product_name_recall_uses_rules_when_brand_and_number_are_clear(self):
         questions = (
             "타이거 200? 상품 이름 뭐였지",
             "그 TIGER S&P500 이름 그 뭐였더라",
-            "069500 상품명이 뭐야",
         )
         for question in questions:
             with self.subTest(question=question):
                 routed = fast_route_question(question, include_product=True)
-                self.assertIsNone(routed)
+                self.assertEqual(routed["routes"], ["product"])
+                self.assertTrue(routed["confirm_product_match"])
+                self.assertEqual(routed["router_mode"], "rule_clues")
+
+        self.assertIsNone(
+            fast_route_question("069500 상품명이 뭐야", include_product=True)
+        )
 
     def test_pronoun_name_recall_uses_recent_product_without_llm(self):
         routed = fast_route_question(
@@ -803,9 +808,10 @@ class ConsultationTest(unittest.TestCase):
             )
 
         product.invoke.assert_not_called()
-        client.responses.create.assert_called_once()
+        client.responses.create.assert_not_called()
         self.assertIn("TIGER 미국S&P500", result["answer"])
-        self.assertIn("혹시 이 상품이 맞으세요?", result["answer"])
+        self.assertIn("이 상품이 맞나요?", result["answer"])
+        self.assertIn("확인 전에는 상품 자료를 조회하지 않습니다", result["answer"])
 
     def test_explicit_news_skips_llm_router_but_still_generates_answer(self):
         client = Mock()

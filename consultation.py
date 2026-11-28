@@ -67,9 +67,95 @@ def _report_progress(progress_callback, stage, detail):
         progress_callback(stage, detail)
 
 
+def _select_product_candidate_with_llm(question, candidates, client):
+    """질문과 DB 후보만 비교해 확인할 후보 하나를 고릅니다.
+
+    LLM은 DB에 없는 상품을 만들 수 없고, 결과는 조회에 바로 사용하지 않습니다.
+    선택된 후보도 반드시 사용자 확인을 받은 뒤 다음 발화에서 조회합니다.
+    """
+    if len(candidates) < 2 or client is None:
+        return candidates[0] if len(candidates) == 1 else None
+
+    allowed_codes = [
+        str(candidate.get("product_code") or "").strip()
+        for candidate in candidates
+        if str(candidate.get("product_code") or "").strip()
+    ]
+    if not allowed_codes:
+        return None
+
+    try:
+        response = client.responses.create(
+            model="gpt-5.4-mini",
+            instructions=(
+                "사용자가 기억하거나 입력한 ETF 표현과 상품 DB 후보를 비교한다. "
+                "후보 중 하나를 명확히 가리키는 단서가 있을 때만 해당 종목코드를 선택한다. "
+                "추측이 필요하거나 둘 이상이 비슷하면 none을 선택한다. "
+                "후보에 없는 상품명이나 종목코드는 절대 만들지 않는다."
+            ),
+            input=json.dumps(
+                {
+                    "question": question,
+                    "candidates": candidates,
+                },
+                ensure_ascii=False,
+            ),
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "etf_candidate_selection",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "product_code": {
+                                "type": "string",
+                                "enum": ["none", *allowed_codes],
+                            },
+                        },
+                        "required": ["product_code"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            max_output_tokens=80,
+            store=False,
+        )
+        selected_code = str(
+            json.loads(response.output_text or "{}")
+            .get("product_code") or "none"
+        )
+    except Exception as error:
+        log_safe_exception(logger, "ETF candidate selection", error)
+        return None
+
+    return next(
+        (
+            candidate
+            for candidate in candidates
+            if str(candidate.get("product_code")) == selected_code
+        ),
+        None,
+    )
+
+
+def _product_confirmation_message(candidate, original_expression):
+    product_name = candidate["product_name"]
+    product_code = candidate.get("product_code")
+    code_text = f"({product_code})" if product_code else ""
+    return (
+        f"'{original_expression}'과(와) 정확히 일치하는 상품은 확인되지 않았습니다. "
+        f"질문의 단서와 가장 가까운 후보는 '{product_name}'{code_text}입니다. "
+        "이 상품이 맞나요? 맞다면 '맞아요'라고 답해 주세요. "
+        "확인 전에는 상품 자료를 조회하지 않습니다."
+    )
+
+
 def _resolve_product_name(
     etf_name,
     *,
+    question=None,
+    client=None,
     require_confirmation=False,
     product_clues=None,
     reject_unknown=False,
@@ -97,12 +183,9 @@ def _resolve_product_name(
             require_confirmation
             and resolution.get("match_type") in {"typo_corrected", "partial_match"}
         ):
-            product_code = resolution["product"].get("product_code")
-            code_text = f"({product_code})" if product_code else ""
-            return canonical_name, (
-                f"'{etf_name}'과(와) 비슷한 상품으로 "
-                f"'{canonical_name}'{code_text}을(를) 찾았습니다. "
-                "혹시 이 상품이 맞으세요? 맞다면 정식 상품명을 포함해 다시 질문해 주세요."
+            return canonical_name, _product_confirmation_message(
+                resolution["product"],
+                etf_name,
             ), True
         if resolution.get("match_type") == "typo_corrected":
             return canonical_name, resolution["message"], False
@@ -110,20 +193,30 @@ def _resolve_product_name(
 
     if resolution.get("error_type") == "ambiguous_product" and resolution.get("candidates"):
         candidates = resolution["candidates"]
+        selected_candidate = _select_product_candidate_with_llm(
+            question or etf_name,
+            candidates,
+            client,
+        )
+        if selected_candidate is not None:
+            return (
+                selected_candidate["product_name"],
+                _product_confirmation_message(
+                    selected_candidate,
+                    etf_name,
+                ),
+                True,
+            )
+
         names = ", ".join(
             f"{item['product_name']}({item['product_code']})"
             for item in candidates
         )
-        if len(candidates) == 1:
-            message = (
-                f"말씀하신 단서와 가장 비슷한 상품은 {names}입니다. "
-                "혹시 이 상품이 맞으세요? 맞다면 정식 상품명을 포함해 다시 질문해 주세요."
-            )
-        else:
-            message = (
-                f"말씀하신 단서와 비슷한 ETF 후보가 여러 개 있습니다: {names}. "
-                "원하시는 상품을 확인한 뒤 정식 상품명을 포함해 다시 질문해 주세요."
-            )
+        message = (
+            f"말씀하신 단서와 비슷한 ETF 후보가 여러 개 있습니다: {names}. "
+            "질문만으로 하나를 안전하게 정할 수 없습니다. "
+            "원하시는 상품명이나 종목코드를 선택해 다시 질문해 주세요."
+        )
         return etf_name, message, True
 
     if reject_unknown and resolution.get("error_type") == "product_not_found":
@@ -243,6 +336,8 @@ def consult(
         product_name, product_notice, needs_product_confirmation = (
             _resolve_product_name(
                 product_name,
+                question=question,
+                client=client,
                 require_confirmation=bool(
                     routes.get("confirm_product_match")
                     or routes.get("product_clues")

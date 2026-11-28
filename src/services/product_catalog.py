@@ -19,6 +19,13 @@ NATURAL_CLUE_MIN_SCORE = 0.72
 NATURAL_CLUE_MARGIN = 0.08
 STRUCTURED_CLUE_MIN_SCORE = 0.45
 STRUCTURED_CLUE_MARGIN = 0.1
+SHORT_MANAGER_ALIASES = {
+    "삼성자산운용": ("삼성",),
+    "미래에셋자산운용": ("미래에셋",),
+    "한국투자신탁운용": ("한국투자",),
+    "신한자산운용": ("신한",),
+    "NH-Amundi자산운용": ("NH", "엔에이치"),
+}
 
 BRAND_ALIASES = {
     "코덱스": "KODEX",
@@ -42,6 +49,7 @@ def _manager_aliases(asset_manager: str) -> tuple:
     """자연어에 자주 쓰는 운용사 축약형을 안전한 길이로 만듭니다."""
     manager = str(asset_manager or "").strip()
     aliases = {manager}
+    aliases.update(SHORT_MANAGER_ALIASES.get(manager, ()))
     for suffix in ("자산운용", "투자신탁운용", "운용"):
         if manager.endswith(suffix):
             core = manager[:-len(suffix)].strip()
@@ -150,6 +158,22 @@ def _is_single_digit_number_typo(query_name: str, product_name: str) -> bool:
     )
 
 
+def _is_visual_brand_typo(query_name: str, product_name: str) -> bool:
+    """상품 숫자는 같고 브랜드의 O/0 한 글자만 혼동한 표현인지 확인합니다."""
+    product_numbers = _numbers(product_name)
+    if len(product_numbers) != 1:
+        return False
+    number = product_numbers[0]
+    if not query_name.endswith(number) or not product_name.endswith(number):
+        return False
+    query_prefix = query_name[:-len(number)]
+    product_prefix = product_name[:-len(number)]
+    return (
+        query_prefix != product_prefix
+        and query_prefix.replace("0", "O") == product_prefix
+    )
+
+
 def _is_in_order(short: str, long: str) -> bool:
     """short의 글자가 long 안에 순서대로 모두 들어 있는지 확인합니다."""
     remaining = iter(long)
@@ -194,15 +218,64 @@ def _fuzzy_match(original_term, normalized_query, products):
     if best_similarity < FUZZY_SUGGEST_MIN:
         return None
 
+    # 숫자 한 자리만 추가·누락됐고 나머지 상품명이 완전히 같은 후보는
+    # 일반 유사도 순위와 별도로 확인합니다. 예를 들어 DB에 KODEX 200TR이
+    # 함께 있으면 KODEX 200과의 1·2위 점수 차이가 작아질 수 있지만,
+    # "KODEX 2000"에서 숫자를 제외한 이름이 같은 후보는 KODEX 200뿐입니다.
+    # 이 안전한 후보가 하나일 때는 다른 유사 상품 때문에 교정이 막히지 않게 합니다.
+    number_typo_candidates = [
+        (similarity, product)
+        for similarity, normalized_name, product in scored
+        if (
+            similarity >= FUZZY_AUTO_MIN
+            and _is_single_digit_number_typo(
+                normalized_query,
+                normalized_name,
+            )
+        )
+    ]
+    if len(number_typo_candidates) == 1:
+        similarity, matched_product = number_typo_candidates[0]
+        product = _candidate(matched_product)
+        return {
+            "success": True,
+            "match_type": "typo_corrected",
+            "message": (
+                f"'{original_term}'을(를) "
+                f"'{product['product_name']}'(으)로 해석했습니다."
+            ),
+            "query": original_term,
+            "normalized_query": normalized_query,
+            "similarity": round(similarity, 3),
+            "product": product,
+        }
+
+    visual_brand_candidates = [
+        product
+        for similarity, normalized_name, product in scored
+        if (
+            similarity >= FUZZY_SUGGEST_MIN
+            and _is_visual_brand_typo(normalized_query, normalized_name)
+        )
+    ]
+    if len(visual_brand_candidates) == 1:
+        return {
+            "success": False,
+            "error_type": "ambiguous_product",
+            "message": (
+                f"'{original_term}'과(와) 정확히 일치하는 ETF는 없지만 "
+                "문자 O와 숫자 0을 혼동했을 가능성이 있는 상품이 있습니다."
+            ),
+            "query": original_term,
+            "normalized_query": normalized_query,
+            "candidates": [_candidate(visual_brand_candidates[0])],
+        }
+
     same_numbers = _numbers(normalized_query) == _numbers(best_name)
-    single_digit_number_typo = _is_single_digit_number_typo(
-        normalized_query,
-        best_name,
-    )
     if (
         best_similarity >= FUZZY_AUTO_MIN
         and best_similarity - second_similarity >= FUZZY_MARGIN
-        and (same_numbers or single_digit_number_typo)
+        and same_numbers
     ):
         product = _candidate(best_product)
         return {
@@ -223,15 +296,20 @@ def _fuzzy_match(original_term, normalized_query, products):
     same_number_pool = [
         item
         for item in scored
-        if query_numbers and _numbers(item[1]) == query_numbers
+        if (
+            query_numbers
+            and _numbers(item[1]) == query_numbers
+            and item[0] >= FUZZY_SUGGEST_MIN
+        )
     ]
-    # 같은 숫자를 가진 후보가 있으면 숫자가 다른 실제 상품은 제외합니다.
+    # 같은 숫자이면서 상품명도 충분히 비슷한 후보가 있으면 숫자가 다른
+    # 상품은 제외합니다. 숫자만 같은 전혀 다른 상품이 후보 검색을 막지 않게 합니다.
     # 예: TIGER S&P500 질문에 TIGER 200을 함께 제시하지 않습니다.
     if same_number_pool:
         suggestion_pool = same_number_pool
     elif query_numbers:
-        # 숫자가 다른 실제 상품을 오타라고 제시하지 않습니다.
-        # KODEX 300을 KODEX 200으로 바꾸는 식의 금융상품 오인 방지입니다.
+        # 숫자가 다른 실제 상품을 임의로 다른 상품 후보로 바꾸지 않습니다.
+        # 예: KODEX 300을 KODEX 200으로 제시하지 않습니다.
         return None
 
     suggestions = [
@@ -269,15 +347,25 @@ def _natural_clue_match(original_term, products):
     for product in products:
         clue_count = 0
         score = 0.0
+        product_name = normalize_product_key(product.get("product_name") or "")
+
+        brand_matched = any(
+            product_name.startswith(brand)
+            and brand in normalized_query
+            for brand in BRAND_ALIASES.values()
+        )
+        if brand_matched:
+            clue_count += 1
+            score += 0.6
+
         manager_matched = any(
             normalize_product_key(alias) in normalized_query
             for alias in _manager_aliases(product.get("asset_manager"))
         )
-        if manager_matched:
+        if manager_matched and not brand_matched:
             clue_count += 1
             score += 0.6
 
-        product_name = normalize_product_key(product.get("product_name") or "")
         product_numbers = _numbers(product_name)
         number_score = 0.0
         if query_numbers and product_numbers:
@@ -586,7 +674,29 @@ def match_products(search_term: str, products: list) -> dict:
         if fuzzy_result is not None:
             return fuzzy_result
 
-        clue_result = _natural_clue_match(original_term, products)
+        # 브랜드와 숫자만으로 된 명시적 상품명은 자연어 단서 검색으로
+        # 다른 숫자의 상품에 연결하지 않습니다. KODEX 300이 DB에 없으면
+        # KODEX 200·100을 후보로 만들지 않고 미등록 상품으로 처리합니다.
+        starts_with_brand = any(
+            normalized_query.startswith(brand)
+            for brand in BRAND_ALIASES.values()
+        )
+        natural_recall_markers = (
+            "뭐", "이름", "상품", "만든", "운용", "따라가", "추종",
+            "기억", "찾아", "확인해", "맞나", "맞아",
+        )
+        explicit_brand_expression = (
+            starts_with_brand
+            and not any(
+                marker in original_term.casefold()
+                for marker in natural_recall_markers
+            )
+        )
+        clue_result = (
+            None
+            if explicit_brand_expression
+            else _natural_clue_match(original_term, products)
+        )
         if clue_result is not None:
             return clue_result
 

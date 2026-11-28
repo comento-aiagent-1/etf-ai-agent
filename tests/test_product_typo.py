@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from consultation import consult
+from orchestrator import fast_route_question
 from src.services.product_catalog import match_products
 
 
@@ -54,6 +55,19 @@ class TypoCorrectionTest(unittest.TestCase):
         self.assertEqual(result["product"]["product_code"], "069500")
         self.assertEqual(result["match_type"], "typo_corrected")
         self.assertIn("KODEX 200", result["message"])
+
+    def test_single_extra_digit_ignores_similar_non_numeric_suffix_product(self):
+        products = PRODUCTS + [{
+            "product_code": "278530",
+            "product_name": "KODEX 200TR",
+            "asset_manager": "삼성자산운용",
+        }]
+
+        result = match_products("코덱스 2000", products)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["product"]["product_code"], "069500")
+        self.assertEqual(result["match_type"], "typo_corrected")
 
 
 class ConfirmationTest(unittest.TestCase):
@@ -220,6 +234,83 @@ class ConsultationProductResolutionTest(unittest.TestCase):
         price.invoke.assert_not_called()
         self.assertIn("비슷한 ETF 후보가 여러 개", result["answer"])
         self.assertIn("KODEX 200(069500)", result["answer"])
+
+    def test_llm_candidate_requires_confirmation_before_price_lookup(self):
+        price = Mock()
+        price.name = "get_etf_price"
+        price.invoke.return_value = json.dumps({
+            "success": True,
+            "data": {
+                "product_name": "KODEX 200",
+                "product_code": "069500",
+                "data_date": "2026-11-27",
+                "close_price": 73770,
+            },
+        })
+        selector_client = Mock()
+        selector_client.responses.create.return_value = Mock(
+            output_text='{"product_code":"069500"}'
+        )
+
+        with patch(
+            "consultation.resolve_etf_product",
+            side_effect=lambda name, **_: match_products(name, PRODUCTS),
+        ), patch.dict(
+            "consultation.DATA_ROUTES",
+            {"etf_price": (price, "etf_name", "시세")},
+        ):
+            first = consult("200 종가 알려줘", "입문", selector_client)
+
+        price.invoke.assert_not_called()
+        self.assertIn("가장 가까운 후보는 'KODEX 200'(069500)", first["answer"])
+        self.assertIn("이 상품이 맞나요", first["answer"])
+
+        answer_client = Mock()
+        answer_client.responses.create.return_value = Mock(
+            output_text="KODEX 200의 기준일 종가는 73,770원입니다."
+        )
+        history = [
+            {"role": "user", "content": "200 종가 알려줘"},
+            {"role": "assistant", "content": first["answer"]},
+        ]
+        with patch(
+            "consultation.resolve_etf_product",
+            side_effect=lambda name, **_: match_products(name, PRODUCTS),
+        ), patch.dict(
+            "consultation.DATA_ROUTES",
+            {"etf_price": (price, "etf_name", "시세")},
+        ):
+            second = consult(
+                "맞아요",
+                "입문",
+                answer_client,
+                conversation_history=history,
+            )
+
+        price.invoke.assert_called_once_with({"etf_name": "KODEX 200"})
+        self.assertIn("73,770원", second["answer"])
+        self.assertEqual(second["router_mode"], "rule_confirmation")
+
+    def test_confirmation_keeps_original_investment_policy_route(self):
+        history = [
+            {"role": "user", "content": "200 지금 사도 돼?"},
+            {
+                "role": "assistant",
+                "content": (
+                    "질문의 단서와 가장 가까운 후보는 "
+                    "'KODEX 200'(069500)입니다. 이 상품이 맞나요?"
+                ),
+            },
+        ]
+
+        result = fast_route_question(
+            "맞아요",
+            include_product=True,
+            conversation_history=history,
+        )
+
+        self.assertEqual(result["routes"], ["investment_guidance"])
+        self.assertEqual(result["etf_name"], "KODEX 200")
 
 
 if __name__ == "__main__":
