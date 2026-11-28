@@ -43,6 +43,7 @@ GENERIC_PRODUCT_SCOPE_TERMS = (
 )
 BROAD_PRODUCT_SUFFIXES = (
     "어때", "어떤데", "괜찮아", "괜찮은가요", "괜찮나요",
+    "어떤 상품이야", "어떤 상품인가요", "무슨 상품이야", "무슨 상품인가요",
 )
 INVESTMENT_ADVICE_TERMS = (
     "사도 돼", "사도 될까", "살까", "구매할까", "구매해도",
@@ -56,6 +57,10 @@ FOLLOW_UP_ACTION_TERMS = (
     "확인해봐", "확인해 봐", "확인해줘", "확인해 줘",
     "알아봐", "알아 봐", "그거 보여줘", "그거 보여 줘", "그거 해줘",
 )
+PRODUCT_CONFIRMATION_TERMS = {
+    "맞아", "맞아요", "네맞아요", "응맞아", "그거야", "그상품맞아",
+    "그상품이맞아", "그etf맞아", "그etf가맞아",
+}
 PRODUCT_RECOMMENDATION_TERMS = (
     "추천", "골라줘", "골라 줘", "뭐가 좋아", "무엇이 좋아",
     "어떤 종목", "어떤 etf", "제일 좋은", "가장 좋은", "1등 etf",
@@ -93,6 +98,11 @@ PRODUCT_EXISTENCE_TERMS = (
     "상품 맞아", "실제 상품", "상장된 상품", "등록된 상품",
     "존재해", "등록돼", "등록되어",
 )
+RECALL_DATABASE_CLUE_TERMS = (
+    "삼성", "미래에셋", "한국투자", "신한", "nh", "엔에이치",
+    "코덱스", "kodex", "타이거", "tiger", "에이스", "ace",
+    "라이즈", "rise", "쏠", "sol", "하나로", "hanaro",
+)
 
 
 def _find_routes(question):
@@ -103,6 +113,51 @@ def _find_routes(question):
         if positions:
             positioned.append((min(positions), route))
     return [route for _, route in sorted(positioned)]
+
+
+def _pending_product_confirmation(conversation_history):
+    """직전 답변의 DB 후보와 원래 조회 의도를 복원합니다."""
+    history = prepare_recent_history(conversation_history)
+    if not history or history[-1].get("role") != "assistant":
+        return None
+
+    assistant_text = history[-1].get("content", "")
+    match = re.search(
+        r"가장 가까운 후보는\s*'([^']+)'\(([A-Za-z0-9]+)\)입니다",
+        assistant_text,
+    )
+    if not match or "이 상품이 맞나요" not in assistant_text:
+        return None
+
+    previous_question = next(
+        (
+            message.get("content", "")
+            for message in reversed(history[:-1])
+            if message.get("role") == "user"
+        ),
+        "",
+    )
+    previous_lowered = previous_question.casefold()
+    if any(term in previous_lowered for term in PERSONALIZED_ALLOCATION_TERMS):
+        routes = ["personalized_allocation"]
+    elif any(term in previous_lowered for term in RETURN_GUARANTEE_TERMS):
+        routes = ["return_guarantee"]
+    elif any(term in previous_lowered for term in PRODUCT_RECOMMENDATION_TERMS):
+        routes = ["product_recommendation"]
+    elif any(term in previous_lowered for term in PRICE_FORECAST_TERMS):
+        routes = ["price_forecast"]
+    elif any(term in previous_lowered for term in INVESTMENT_ADVICE_TERMS):
+        routes = ["investment_guidance"]
+    else:
+        routes = _find_routes(previous_question)
+    if not routes:
+        routes = ["product"]
+
+    return {
+        "routes": list(dict.fromkeys(routes)),
+        "etf_name": match.group(1).strip(),
+        "product_code": match.group(2).strip(),
+    }
 
 
 def _extract_product_expression(question, routes):
@@ -265,6 +320,17 @@ def fast_route_question(question, *, include_product=False, conversation_history
     if not lowered:
         return None
 
+    normalized_reply = re.sub(r"[^0-9a-z가-힣]+", "", lowered)
+    if normalized_reply in PRODUCT_CONFIRMATION_TERMS:
+        pending = _pending_product_confirmation(conversation_history)
+        if pending is not None:
+            return {
+                "routes": pending["routes"],
+                "etf_name": pending["etf_name"],
+                "confirmed_product_code": pending["product_code"],
+                "router_mode": "rule_confirmation",
+            }
+
     # 직전 답변이 제안한 조회를 승인하는 짧은 후속 발화는
     # 제안된 항목과 최근 상품을 함께 복원합니다.
     if any(term in lowered for term in FOLLOW_UP_ACTION_TERMS):
@@ -300,6 +366,17 @@ def fast_route_question(question, *, include_product=False, conversation_history
                     "etf_name": recent_product,
                     "router_mode": "rule",
                 }
+        if (
+            include_product
+            and re.search(r"\d", lowered)
+            and any(term in lowered for term in RECALL_DATABASE_CLUE_TERMS)
+        ):
+            return {
+                "routes": ["product"],
+                "etf_name": str(question or "").strip(),
+                "confirm_product_match": True,
+                "router_mode": "rule_clues",
+            }
         return None
 
     # 사용자가 입력한 이름이 실제 등록 상품인지 묻는 질문은 LLM이 비슷한
