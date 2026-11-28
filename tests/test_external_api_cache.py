@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 
 import api_tools
+from news_api import resolve_news_links, tokenize_news_links
 import news_tools
 from src.services.ttl_cache import TTLCache
 
@@ -62,9 +63,25 @@ class ExternalApiCacheTest(unittest.TestCase):
         self.assertEqual(fetch.call_count, 1)
         self.assertFalse(first["cache_hit"])
         self.assertTrue(second["cache_hit"])
-        self.assertTrue(first["articles"][0]["url"].startswith("NEWS_LINK_"))
-        self.assertTrue(second["articles"][0]["url"].startswith("NEWS_LINK_"))
+        self.assertEqual(first["articles"][0]["url"], "https://news.google.com/articles/test")
+        self.assertEqual(second["articles"][0]["url"], "https://news.google.com/articles/test")
         self.assertEqual(raw_result["articles"][0]["url"], "https://news.google.com/articles/test")
+
+    def test_news_link_tokens_are_request_scoped(self):
+        articles = [{"title": "기사", "url": "https://news.google.com/articles/test"}]
+
+        first_articles, first_map = tokenize_news_links(articles)
+        second_articles, second_map = tokenize_news_links(articles)
+        first_token = first_articles[0]["url"]
+        second_token = second_articles[0]["url"]
+
+        self.assertNotEqual(first_token, second_token)
+        self.assertEqual(
+            resolve_news_links(first_token, first_map),
+            "https://news.google.com/articles/test",
+        )
+        self.assertEqual(resolve_news_links(first_token, second_map), "")
+        self.assertEqual(articles[0]["url"], "https://news.google.com/articles/test")
 
     def test_disclosure_result_is_reused(self):
         raw_result = {
