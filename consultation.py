@@ -356,7 +356,15 @@ def consult(
                 )
             notices.append(f"{label} 자료를 확인하지 못했습니다.")
         elif route == "clarify":
-            notices.append("어떤 ETF의 어떤 정보가 궁금한가요? 상품명이나 종목코드를 적어 주세요.")
+            clarify_fields = routes.get("clarify_fields") or []
+            if clarify_fields:
+                field_text = "·".join(clarify_fields)
+                notices.append(
+                    f"앞서 말씀드린 {field_text} 정보를 조회하려면 대상 상품이 필요합니다. "
+                    "조회할 ETF의 상품명이나 종목코드를 적어 주세요."
+                )
+            else:
+                notices.append("어떤 ETF의 어떤 정보가 궁금한가요? 상품명이나 종목코드를 적어 주세요.")
         elif route == "unsupported":
             notices.append("요청한 상품의 자료를 확인할 수 없습니다. 현재 시세·공시는 KODEX 200과 KODEX 인도Nifty미드캡100을 지원합니다.")
         elif route == "return_unsupported":
@@ -385,12 +393,25 @@ def consult(
                     "원하시면 확인 가능한 상품정보·시세·공시·뉴스를 각각 조회해 드릴 수 있습니다."
                 )
             else:
-                notices.append(
-                    "특정 ETF의 매수·매도·보유 판단이나 상품 추천은 제공하지 않습니다. "
-                    "투자 결정 전에는 투자설명서의 위험등급, 총보수, 기초지수, "
-                    "손실 가능성과 본인의 투자기간을 직접 확인해 주세요. "
-                    "원하시면 상품명을 기준으로 확인 가능한 자료를 조회해 드릴 수 있습니다."
-                )
+                if "etf" in question.casefold() and any(
+                    term in question for term in ("잃", "손실", "괜찮")
+                ):
+                    notices.append(
+                        "ETF라고 해서 자동으로 안전한 것은 아닙니다. 여러 종목이나 자산에 "
+                        "분산하는 ETF는 개별 종목에만 투자할 때의 집중 위험을 낮출 수 있지만, "
+                        "시장 하락·상품 구조·환율 등에 따라 원금 손실이 발생할 수 있습니다. "
+                        "이전 투자에서 큰 손실을 경험했다면 감당 가능한 손실 범위와 투자기간을 "
+                        "먼저 정하고 투자설명서의 위험등급·총보수·기초지수를 확인해 주세요. "
+                        "특정 ETF의 매수·매도 판단이나 상품 추천은 제공하지 않지만, "
+                        "상품명을 알려주시면 확인 가능한 객관적 자료를 조회해 드릴 수 있습니다."
+                    )
+                else:
+                    notices.append(
+                        "특정 ETF의 매수·매도·보유 판단이나 상품 추천은 제공하지 않습니다. "
+                        "투자 결정 전에는 투자설명서의 위험등급, 총보수, 기초지수, "
+                        "손실 가능성과 본인의 투자기간을 직접 확인해 주세요. "
+                        "원하시면 상품명을 기준으로 확인 가능한 자료를 조회해 드릴 수 있습니다."
+                    )
         elif route == "product_recommendation":
             if product_name != "none":
                 notices.append(
